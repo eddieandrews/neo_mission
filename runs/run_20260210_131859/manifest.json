@@ -1,0 +1,112 @@
+{
+  "timestamp": "2026-02-10T13:52:57.023564",
+  "cfg": {
+    "observatorio": "Y28",
+    "data_inicio": "2026-02-10",
+    "data_fim": "2026-02-24",
+    "hora_inicio_utc": null,
+    "step_min": 20,
+    "ALT_MIN": 20.0,
+    "ALT_MAX": 70.0,
+    "V_MAX": 18.5,
+    "SOL_ALT_MAX": null,
+    "LIMIAR_RAPIDO": 10.0,
+    "peso_recencia": 0.45,
+    "peso_mag": 0.45,
+    "peso_vel": 0.09999999999999998,
+    "ANALISE_PADRAO": "CORES (g', r', i', z')",
+    "pasta_runs": "runs",
+    "pasta_cache": "cache"
+  },
+  "inputs": {
+    "jpl_files": [
+      "visivel-2026-02-10.csv"
+    ]
+  },
+  "auditoria": {
+    "JPL": {
+      "jpl_total_linhas": 52,
+      "jpl_coluna_nome": "Object Name",
+      "jpl_objetos_unicos": 52,
+      "jpl_amostra_objetos": [
+        "1948 EA",
+        "1948 OA",
+        "1959 LM",
+        "1972 XA",
+        "1973 EC",
+        "1987 QA",
+        "1990 BG",
+        "1990 XJ",
+        "1992 FE",
+        "1998 KV2",
+        "1998 WT30",
+        "1998 YP11",
+        "1999 AO10",
+        "1999 KV4",
+        "1999 OW3"
+      ]
+    },
+    "MPC": {
+      "mpc_modo": "astroquery",
+      "objetos_entrada": 52,
+      "objetos_cache": 41,
+      "objetos_baixados": 11,
+      "objetos_falha": 0,
+      "falhas": [],
+      "step_min_normalizado": 20.0,
+      "step_q": "20.0 min",
+      "start_t_isot": "2026-02-10T00:00:00.000",
+      "n_steps": 1009,
+      "colunas_retorno_mpc_exemplo": [
+        "Date",
+        "RA",
+        "Dec",
+        "Delta",
+        "r",
+        "Elongation",
+        "Phase",
+        "V",
+        "Proper motion",
+        "Direction",
+        "Azimuth",
+        "Altitude",
+        "Sun altitude",
+        "Moon phase",
+        "Moon distance",
+        "Moon altitude",
+        "Uncertainty 3sig",
+        "Unc. P.A."
+      ],
+      "pm_unidade_heuristica": "\"/h → \"/min",
+      "sun_alt_col": "Sun altitude",
+      "linhas_mpc_total": 52468,
+      "objetos_com_dados": 52,
+      "tempo_total_s": 8.36,
+      "V_min": 11.2,
+      "V_max": 20.4,
+      "ALT_min": -89.0,
+      "ALT_max": 89.0,
+      "mu_med": 3.673333333333333,
+      "mu_max": 72.24,
+      "SUN_ALT_min": -71.0,
+      "SUN_ALT_max": 88.0
+    },
+    "Filtros": {
+      "linhas_total": 52468,
+      "linhas_SOL_ok": null,
+      "linhas_V_ok": 49260,
+      "linhas_ALT_ok": 17493,
+      "linhas_VeALT": 16439,
+      "linhas_VeALTeSOL": 16439,
+      "objetos_obs": 51
+    },
+    "Classe": {
+      "objetos_total": 51,
+      "rapidos_obj": 18,
+      "lentos_obj": 33
+    },
+    "Resumo": {
+      "objetos_resumo": 51
+    }
+  }
+}

@@ -1,0 +1,98 @@
+{
+  "timestamp": "2026-02-06T18:58:17.705185",
+  "cfg": {
+    "observatorio": "Y28",
+    "data_inicio": "2026-02-10",
+    "data_fim": "2026-02-24",
+    "hora_inicio_utc": null,
+    "step_min": 20,
+    "ALT_MIN": 20.0,
+    "ALT_MAX": 70.0,
+    "V_MAX": 19.0,
+    "SOL_ALT_MAX": null,
+    "LIMIAR_RAPIDO": 10.0,
+    "peso_recencia": 0.45,
+    "peso_mag": 0.45,
+    "peso_vel": 0.09999999999999998,
+    "ANALISE_PADRAO": "CORES (g', r', i', z')",
+    "pasta_runs": "runs",
+    "pasta_cache": "cache"
+  },
+  "inputs": {
+    "jpl_files": [
+      "visivel-2026-02-10.csv"
+    ]
+  },
+  "auditoria": {
+    "JPL": {
+      "jpl_total_linhas": 1,
+      "jpl_coluna_nome": "Object Name",
+      "jpl_objetos_unicos": 1,
+      "jpl_amostra_objetos": [
+        "2026 BC2"
+      ]
+    },
+    "MPC": {
+      "mpc_modo": "astroquery",
+      "objetos_entrada": 1,
+      "objetos_cache": 1,
+      "objetos_baixados": 0,
+      "objetos_falha": 0,
+      "falhas": [],
+      "step_min_normalizado": 20.0,
+      "step_q": "20.0 min",
+      "start_t_isot": "2026-02-10T00:00:00.000",
+      "n_steps": 1009,
+      "colunas_retorno_mpc_exemplo": [
+        "Date",
+        "RA",
+        "Dec",
+        "Delta",
+        "r",
+        "Elongation",
+        "Phase",
+        "V",
+        "Proper motion",
+        "Direction",
+        "Azimuth",
+        "Altitude",
+        "Sun altitude",
+        "Moon phase",
+        "Moon distance",
+        "Moon altitude",
+        "Uncertainty 3sig",
+        "Unc. P.A."
+      ],
+      "pm_unidade_heuristica": "\"/h → \"/min",
+      "sun_alt_col": "Sun altitude",
+      "linhas_mpc_total": 1009,
+      "objetos_com_dados": 1,
+      "tempo_total_s": 0.03,
+      "V_min": 18.7,
+      "V_max": 19.6,
+      "ALT_min": -90.0,
+      "ALT_max": 72.0,
+      "mu_med": 5.505166666666667,
+      "mu_max": 6.543666666666667,
+      "SUN_ALT_min": -71.0,
+      "SUN_ALT_max": 88.0
+    },
+    "Filtros": {
+      "linhas_total": 1009,
+      "linhas_SOL_ok": null,
+      "linhas_V_ok": 651,
+      "linhas_ALT_ok": 369,
+      "linhas_VeALT": 236,
+      "linhas_VeALTeSOL": 236,
+      "objetos_obs": 1
+    },
+    "Classe": {
+      "objetos_total": 1,
+      "rapidos_obj": 0,
+      "lentos_obj": 1
+    },
+    "Resumo": {
+      "objetos_resumo": 1
+    }
+  }
+}
