@@ -26,6 +26,7 @@ def _init_status():
             "etapa4": {"ok": False, "msg": "", "aud": None},
         }
 
+
 def _render_status_cards():
     st.subheader("Status do pipeline (persistente)")
     cols = st.columns(4)
@@ -46,6 +47,26 @@ def _render_status_cards():
             else:
                 box.info(msg)
 
+
+def _salvar_manifest_atual(run_dir: Path, cfg: ConfigMissao, jpl_paths):
+    """
+    Salva o manifesto sempre com a auditoria consolidada mais recente.
+    Mantém compatibilidade mesmo se não existir etapa de Taxonomia no app atual.
+    """
+    aud_etapa3 = (st.session_state.status.get("etapa3", {}) or {}).get("aud", {}) or {}
+    aud_total = {
+        "JPL": st.session_state.get("aud_jpl", {}) or {},
+        "MPC": st.session_state.get("aud_mpc", {}) or {},
+        "Filtros": aud_etapa3.get("Filtros"),
+        "Classe": aud_etapa3.get("Classe"),
+        "Resumo": aud_etapa3.get("Resumo"),
+        "Taxonomia": st.session_state.get("aud_tax", None),
+        "Pos_ESA": st.session_state.get("aud_pos_esa", None),
+    }
+    salvar_manifest(run_dir, cfg, inputs={"jpl_files": [p.name for p in jpl_paths]}, aud=aud_total)
+    return aud_total
+
+
 _init_status()
 
 
@@ -60,7 +81,7 @@ cfg = ConfigMissao(
     data_fim=st.sidebar.text_input("Data fim (YYYY-MM-DD)", "2026-01-25"),
 
     # NOVO: hora início UTC (opcional)
-    hora_inicio_utc=st.sidebar.text_input("Hora início UTC (HH:MM) (opcional)", "" ).strip() or None,
+    hora_inicio_utc=st.sidebar.text_input("Hora início UTC (HH:MM) (opcional)", "").strip() or None,
 
     step_min=st.sidebar.selectbox("Step (min)", [5, 10, 15, 20, 30, 60], index=1),
     ALT_MIN=st.sidebar.number_input("ALT_MIN (deg)", value=20.0, step=1.0),
@@ -291,16 +312,8 @@ if st.button("Filtrar → Classificar → Resumir → Ranqueiar"):
     st.session_state.status["etapa3"]["msg"] = f"OK — objetos={len(ranked) if hasattr(ranked, '__len__') else 0}"
     st.session_state.status["etapa3"]["aud"] = {"Filtros": aud_filt, "Classe": aud_cls, "Resumo": aud_sum}
 
-    aud_total = {
-        "JPL": st.session_state.get("aud_jpl", {}) or {},
-        "MPC": st.session_state.get("aud_mpc", {}) or {},
-        "Filtros": aud_filt,
-        "Classe": aud_cls,
-        "Resumo": aud_sum,
-        "Pos_ESA": st.session_state.get("aud_pos_esa", None),
-    }
-
-    salvar_manifest(run_dir, cfg, inputs={"jpl_files": [p.name for p in jpl_paths]}, aud=aud_total)
+    # Manifesto consolidado com auditoria atual
+    aud_total = _salvar_manifest_atual(run_dir, cfg, jpl_paths)
 
     st.success("Pipeline executado. Manifesto salvo.")
     st.subheader("Auditoria")
@@ -375,6 +388,9 @@ else:
         st.session_state.status["etapa4"]["msg"] = f"Encontrados {len(final_pos)}/{len(pos_list)}"
         st.session_state.status["etapa4"]["aud"] = aud_pos
 
+        # NOVO: persistir manifesto após atualização pós-ESA
+        _salvar_manifest_atual(run_dir, cfg, jpl_paths)
+
         st.subheader("Auditoria Pós-ESA")
         st.json(aud_pos)
 
@@ -396,4 +412,3 @@ else:
                 data=csv_path.read_bytes(),
                 file_name=csv_path.name
             )
-
