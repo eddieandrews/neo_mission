@@ -6,7 +6,8 @@ import time
 from pipeline import (
     ConfigMissao, validar_cfg, criar_run_dir, salvar_manifest,
     ler_jpl_csvs, filtrar_epocas, classificar_velocidade,
-    resumir_por_objeto, ranquear, obter_mpc_astroquery
+    resumir_por_objeto, ranquear, obter_mpc_astroquery,
+    enriquecer_taxonomia_rocks,
 )
 
 st.set_page_config(page_title="Y28 NEO Mission Pipeline", layout="wide")
@@ -14,32 +15,38 @@ st.title("Y28 — Seleção de NEOs para Cores (Pipeline Auditável)")
 
 
 # =========================
-# Helpers: status persistente por etapa
+# Helpers (estado + manifest)
 # =========================
-def _init_status():
+def _init_state():
     if "status" not in st.session_state:
         st.session_state.status = {
             "run": None,
-            "etapa1": {"ok": False, "msg": "", "aud": None},
-            "etapa2": {"ok": False, "msg": "", "aud": None},
-            "etapa3": {"ok": False, "msg": "", "aud": None},
-            "etapa4": {"ok": False, "msg": "", "aud": None},
+            "etapa1": {"ok": False, "msg": "—", "aud": None},
+            "etapa2": {"ok": False, "msg": "—", "aud": None},
+            "etapa3": {"ok": False, "msg": "—", "aud": None},
+            "etapa4": {"ok": False, "msg": "—", "aud": None},
         }
+
+    for k in [
+        "run_dir",
+        "df_jpl", "lista_obj", "aud_jpl",
+        "df_mpc_raw", "aud_mpc",
+        "df_obs", "summary", "ranked",
+        "ranked_tax", "aud_tax",
+        "aud_pos_esa",
+    ]:
+        if k not in st.session_state:
+            st.session_state[k] = None
 
 
 def _render_status_cards():
     st.subheader("Status do pipeline (persistente)")
     cols = st.columns(4)
-    etapa_map = [
-        ("Etapa 1", "etapa1"),
-        ("Etapa 2", "etapa2"),
-        ("Etapa 3", "etapa3"),
-        ("Etapa 4", "etapa4"),
-    ]
-    for c, (label, key) in zip(cols, etapa_map):
+    etapas = [("Etapa 1", "etapa1"), ("Etapa 2", "etapa2"), ("Etapa 3", "etapa3"), ("Etapa 4", "etapa4")]
+    for c, (label, key) in zip(cols, etapas):
         with c:
             box = st.container(border=True)
-            ok = st.session_state.status[key]["ok"]
+            ok = bool(st.session_state.status[key]["ok"])
             msg = st.session_state.status[key]["msg"] or "—"
             box.markdown(f"**{label}**")
             if ok:
@@ -49,10 +56,6 @@ def _render_status_cards():
 
 
 def _salvar_manifest_atual(run_dir: Path, cfg: ConfigMissao, jpl_paths):
-    """
-    Salva o manifesto sempre com a auditoria consolidada mais recente.
-    Mantém compatibilidade mesmo se não existir etapa de Taxonomia no app atual.
-    """
     aud_etapa3 = (st.session_state.status.get("etapa3", {}) or {}).get("aud", {}) or {}
     aud_total = {
         "JPL": st.session_state.get("aud_jpl", {}) or {},
@@ -67,11 +70,24 @@ def _salvar_manifest_atual(run_dir: Path, cfg: ConfigMissao, jpl_paths):
     return aud_total
 
 
-_init_status()
+def _parse_lista_pos_esa(txt: str):
+    if not txt:
+        return []
+    linhas = [x.strip() for x in txt.splitlines()]
+    linhas = [x for x in linhas if x]
+    out = []
+    for s in linhas:
+        s = s.replace("(", "").replace(")", "").strip()
+        s = " ".join(s.split())
+        out.append(s)
+    return out
+
+
+_init_state()
 
 
 # =========================
-# Sidebar: parâmetros
+# Sidebar
 # =========================
 st.sidebar.header("Parâmetros da Missão")
 
@@ -79,29 +95,22 @@ cfg = ConfigMissao(
     observatorio=st.sidebar.text_input("Observatório", "Y28"),
     data_inicio=st.sidebar.text_input("Data início (YYYY-MM-DD)", "2026-01-11"),
     data_fim=st.sidebar.text_input("Data fim (YYYY-MM-DD)", "2026-01-25"),
-
-    # NOVO: hora início UTC (opcional)
     hora_inicio_utc=st.sidebar.text_input("Hora início UTC (HH:MM) (opcional)", "").strip() or None,
-
     step_min=st.sidebar.selectbox("Step (min)", [5, 10, 15, 20, 30, 60], index=1),
     ALT_MIN=st.sidebar.number_input("ALT_MIN (deg)", value=20.0, step=1.0),
     ALT_MAX=st.sidebar.number_input("ALT_MAX (deg)", value=70.0, step=1.0),
     V_MAX=st.sidebar.number_input("V_MAX", value=19.0, step=0.1),
-
-    # NOVO: filtro por céu escuro (altura do Sol)
     SOL_ALT_MAX=st.sidebar.number_input(
         "SOL_ALT_MAX (deg) (opcional, céu escuro)",
         value=float("nan"),
-        help="Use -18 (astronômico), -12 (náutico), -6 (civil). Deixe vazio para não filtrar."
+        help="Use -18 (astronômico), -12 (náutico), -6 (civil). Deixe vazio para não filtrar.",
     ),
-
     LIMIAR_RAPIDO=st.sidebar.number_input('Limiar rápido μ ("/min)', value=10.0, step=0.5),
     peso_recencia=st.sidebar.slider("Peso recência", 0.0, 1.0, 0.45, 0.05),
     peso_mag=st.sidebar.slider("Peso magnitude", 0.0, 1.0, 0.45, 0.05),
-    peso_vel=0.0,  # ajustamos abaixo
+    peso_vel=0.0,
 )
 
-# converte SOL_ALT_MAX: se NaN => None
 try:
     if pd.isna(cfg.SOL_ALT_MAX):
         cfg.SOL_ALT_MAX = None
@@ -121,12 +130,7 @@ else:
 
 st.sidebar.divider()
 st.sidebar.header("Arquivos de entrada (JPL)")
-
-uploaded = st.sidebar.file_uploader(
-    "Envie 1 ou mais CSVs do JPL",
-    type=["csv"],
-    accept_multiple_files=True
-)
+uploaded = st.sidebar.file_uploader("Envie 1 ou mais CSVs do JPL", type=["csv"], accept_multiple_files=True)
 
 st.sidebar.divider()
 st.sidebar.header("Pós-ESA (opcional)")
@@ -134,18 +138,7 @@ post_esa_text = st.sidebar.text_area("Cole a lista pós-ESA (1 por linha)", heig
 
 
 # =========================
-# Estado do app (dados)
-# =========================
-if "run_dir" not in st.session_state:
-    st.session_state.run_dir = None
-
-for k in ["df_jpl", "lista_obj", "aud_jpl", "df_mpc_raw", "aud_mpc", "df_obs", "summary", "ranked", "aud_pos_esa"]:
-    if k not in st.session_state:
-        st.session_state[k] = None
-
-
-# =========================
-# Status cards sempre visíveis
+# Status cards
 # =========================
 _render_status_cards()
 st.divider()
@@ -165,17 +158,21 @@ with colA:
             st.session_state.run_dir = run_dir
             st.session_state.status["run"] = str(run_dir)
 
-            # limpa dados e status das etapas
-            for k in ["df_jpl", "lista_obj", "aud_jpl", "df_mpc_raw", "aud_mpc", "df_obs", "summary", "ranked", "aud_pos_esa"]:
+            # limpa dados
+            for k in [
+                "df_jpl", "lista_obj", "aud_jpl",
+                "df_mpc_raw", "aud_mpc",
+                "df_obs", "summary", "ranked",
+                "ranked_tax", "aud_tax",
+                "aud_pos_esa",
+            ]:
                 st.session_state[k] = None
 
-            for etapa in ["etapa1", "etapa2", "etapa3", "etapa4"]:
-                st.session_state.status[etapa] = {"ok": False, "msg": "—", "aud": None}
-
-            st.session_state.status["etapa1"]["msg"] = "Aguardando leitura JPL"
-            st.session_state.status["etapa2"]["msg"] = "Aguardando MPC"
-            st.session_state.status["etapa3"]["msg"] = "Aguardando filtros/ranking"
-            st.session_state.status["etapa4"]["msg"] = "Aguardando Pós-ESA"
+            # reset status
+            st.session_state.status["etapa1"] = {"ok": False, "msg": "Aguardando leitura JPL", "aud": None}
+            st.session_state.status["etapa2"] = {"ok": False, "msg": "Aguardando MPC", "aud": None}
+            st.session_state.status["etapa3"] = {"ok": False, "msg": "Aguardando filtros/ranking", "aud": None}
+            st.session_state.status["etapa4"] = {"ok": False, "msg": "Aguardando Pós-ESA", "aud": None}
 
             st.success(f"Run criada: {run_dir}")
 
@@ -184,17 +181,17 @@ with colB:
 
 st.divider()
 
-
-# =========================
-# Etapa 1: JPL
-# =========================
-st.header("Etapa 1 — Ler e normalizar JPL")
-
 if st.session_state.run_dir is None:
     st.info("Clique em **Iniciar nova execução (run)** para começar.")
     st.stop()
 
 run_dir: Path = st.session_state.run_dir
+
+
+# =========================
+# Etapa 1 — JPL
+# =========================
+st.header("Etapa 1 — Ler e normalizar JPL")
 
 jpl_paths = []
 if uploaded:
@@ -229,7 +226,7 @@ st.divider()
 
 
 # =========================
-# Etapa 2: MPC automático + progresso real
+# Etapa 2 — MPC
 # =========================
 st.header("Etapa 2 — MPC automático (astroquery) + cache")
 
@@ -252,7 +249,6 @@ if st.button("Buscar efemérides MPC (astroquery)"):
         detail = st.empty()
         t0 = time.time()
 
-        # callback que o pipeline chama a cada objeto/fase
         def progress_cb(i_atual: int, total: int, obj: str, fase: str):
             total = max(1, int(total))
             i_atual = int(i_atual)
@@ -288,7 +284,7 @@ st.divider()
 
 
 # =========================
-# Etapa 3: Filtros + resumo + ranking
+# Etapa 3 — Filtros + ranking
 # =========================
 st.header("Etapa 3 — Filtros, resumo e ranking")
 
@@ -312,7 +308,6 @@ if st.button("Filtrar → Classificar → Resumir → Ranqueiar"):
     st.session_state.status["etapa3"]["msg"] = f"OK — objetos={len(ranked) if hasattr(ranked, '__len__') else 0}"
     st.session_state.status["etapa3"]["aud"] = {"Filtros": aud_filt, "Classe": aud_cls, "Resumo": aud_sum}
 
-    # Manifesto consolidado com auditoria atual
     aud_total = _salvar_manifest_atual(run_dir, cfg, jpl_paths)
 
     st.success("Pipeline executado. Manifesto salvo.")
@@ -334,28 +329,65 @@ st.divider()
 
 
 # =========================
-# Etapa 4 — Pós-ESA (implementada)
+# Taxonomia — ROCKS (opcional)
+# =========================
+st.header("Taxonomia (ROCKS) — opcional")
+
+if st.session_state.ranked is None:
+    st.info("Rode a Etapa 3 antes de consultar taxonomia.")
+else:
+    ranked = st.session_state.ranked
+
+    st.caption("Consulta via pacote rocks. Se rocks não estiver disponível, a auditoria vai indicar.")
+    if st.button("Enriquecer ranking com taxonomia (ROCKS)"):
+        tax_status = st.empty()
+
+        def tax_progress_cb(i_atual: int, total: int, obj: str, fase: str):
+            tax_status.info(f"Taxonomia {i_atual}/{total}: {obj} ({fase})")
+
+        ranked_tax, aud_tax = enriquecer_taxonomia_rocks(ranked, progress_cb=tax_progress_cb)
+        st.session_state.ranked_tax = ranked_tax
+        st.session_state.aud_tax = aud_tax
+
+        aud_total = _salvar_manifest_atual(run_dir, cfg, jpl_paths)
+
+        st.success("Enriquecimento de taxonomia concluído.")
+        st.subheader("Auditoria Taxonomia")
+        st.json(aud_tax)
+
+        with st.expander("Manifest atualizado (auditoria consolidada)", expanded=False):
+            st.json(aud_total)
+
+        if not ranked_tax.empty:
+            st.subheader("Tabela com taxonomia (prévia)")
+            st.dataframe(ranked_tax.head(50), use_container_width=True)
+
+            out_dir = run_dir / "outputs"
+            out_dir.mkdir(exist_ok=True)
+            csv_tax = out_dir / "neos_tabela_geral_taxonomia.csv"
+            ranked_tax.to_csv(csv_tax, sep=";", index=False)
+
+            st.download_button(
+                "Baixar neos_tabela_geral_taxonomia.csv",
+                data=csv_tax.read_bytes(),
+                file_name=csv_tax.name,
+            )
+
+st.divider()
+
+
+# =========================
+# Etapa 4 — Pós-ESA
 # =========================
 st.header("Etapa 4 — Pós-ESA (opcional)")
-st.caption("Cole a lista pós-ESA na sidebar para filtrar a tabela ranqueada e exportar a versão final.")
+st.caption("Cole a lista pós-ESA na sidebar. Se tiver taxonomia, usamos a tabela enriquecida automaticamente.")
 
 if st.session_state.ranked is None:
     st.info("Rode a Etapa 3 antes de usar Pós-ESA.")
 else:
-    ranked = st.session_state.ranked.copy()
-
-    def _parse_lista_pos_esa(txt: str):
-        if not txt:
-            return []
-        linhas = [x.strip() for x in txt.splitlines()]
-        linhas = [x for x in linhas if x]
-        # normalização básica
-        out = []
-        for s in linhas:
-            s = s.replace("(", "").replace(")", "").strip()
-            s = " ".join(s.split())
-            out.append(s)
-        return out
+    ranked_base = st.session_state.ranked
+    if st.session_state.ranked_tax is not None:
+        ranked_base = st.session_state.ranked_tax
 
     pos_list = _parse_lista_pos_esa(post_esa_text)
 
@@ -366,13 +398,18 @@ else:
     else:
         st.success(f"Lista Pós-ESA detectada: {len(pos_list)} objetos.")
 
-        ranked["Nome_do_objeto_sem_asterisco"] = (
-            ranked["Nome do objeto"].astype(str).str.replace("*", "", regex=False).str.strip()
-        )
-        ranked["Nome_limpo_norm"] = ranked["Nome_limpo"].astype(str).str.strip()
+        df = ranked_base.copy()
 
-        mask = ranked["Nome_limpo_norm"].isin(pos_list) | ranked["Nome_do_objeto_sem_asterisco"].isin(pos_list)
-        final_pos = ranked[mask].copy().reset_index(drop=True)
+        # compatível com versões que tenham "Nome do objeto" ou só "Nome_limpo"
+        if "Nome do objeto" in df.columns:
+            df["Nome_do_objeto_sem_asterisco"] = df["Nome do objeto"].astype(str).str.replace("*", "", regex=False).str.strip()
+        else:
+            df["Nome_do_objeto_sem_asterisco"] = df["Nome_limpo"].astype(str).str.strip()
+
+        df["Nome_limpo_norm"] = df["Nome_limpo"].astype(str).str.strip()
+
+        mask = df["Nome_limpo_norm"].isin(pos_list) | df["Nome_do_objeto_sem_asterisco"].isin(pos_list)
+        final_pos = df[mask].copy().reset_index(drop=True)
 
         encontrados = set(final_pos["Nome_limpo_norm"].tolist()) | set(final_pos["Nome_do_objeto_sem_asterisco"].tolist())
         nao_encontrados = [x for x in pos_list if x not in encontrados]
@@ -388,15 +425,15 @@ else:
         st.session_state.status["etapa4"]["msg"] = f"Encontrados {len(final_pos)}/{len(pos_list)}"
         st.session_state.status["etapa4"]["aud"] = aud_pos
 
-        # NOVO: persistir manifesto após atualização pós-ESA
         _salvar_manifest_atual(run_dir, cfg, jpl_paths)
 
         st.subheader("Auditoria Pós-ESA")
         st.json(aud_pos)
 
         if final_pos.empty:
-            st.warning("Nenhum item da lista Pós-ESA foi encontrado na tabela ranqueada.")
+            st.warning("Nenhum item da lista Pós-ESA foi encontrado na tabela base.")
         else:
+            # limpa colunas auxiliares
             final_show = final_pos.drop(columns=["Nome_do_objeto_sem_asterisco", "Nome_limpo_norm"], errors="ignore")
 
             st.subheader("Tabela final Pós-ESA (ranqueada)")

@@ -2,13 +2,20 @@ from __future__ import annotations
 
 import json
 import hashlib
+import importlib
 from dataclasses import dataclass, asdict
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional, Callable, Any
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+
+# Astropy (já está no requirements do seu projeto)
+from astropy import units as u
+
+# Tipos auxiliares
+ProgressCB = Optional[Callable[[int, int, str, str], None]]
 
 
 # =========================
@@ -23,548 +30,74 @@ class ConfigMissao:
     data_fim: str = "2026-01-25"
 
     # Hora UTC opcional para o início (HH:MM). Se None, assume 00:00.
-    # Ex.: "18:00" -> começa em 2026-01-11T18:00:00Z.
     hora_inicio_utc: Optional[str] = None
 
     # passo temporal em minutos
     step_min: int = 10
 
+    # Filtros
     ALT_MIN: float = 20.0
     ALT_MAX: float = 70.0
     V_MAX: float = 19.0
 
-    # (opcional) filtrar apenas céu escuro via altura do Sol (graus)
-    # Ex.: -18 (astronômico), -12 (náutico), -6 (civil)
-    # Se None, não filtra por Sol.
+    # Filtro opcional de céu escuro (altura do Sol). Se None, não filtra.
     SOL_ALT_MAX: Optional[float] = None
 
-    # classificação rápido/lento usando mu_total ("/min)
-    LIMIAR_RAPIDO: float = 10.0
+    # Classificação de velocidade
+    LIMIAR_RAPIDO: float = 10.0  # arcsec/min
 
-    # ranking
+    # Pesos do ranking (somam ~1)
     peso_recencia: float = 0.45
     peso_mag: float = 0.45
     peso_vel: float = 0.10
 
-    ANALISE_PADRAO: str = "CORES (g', r', i', z')"
-
+    # Pastas
     pasta_runs: str = "runs"
     pasta_cache: str = "cache"
 
 
-# =========================
-# Utilidades / auditoria
-# =========================
-def _sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
 def validar_cfg(cfg: ConfigMissao) -> List[str]:
     erros: List[str] = []
-    try:
-        di = date.fromisoformat(cfg.data_inicio)
-        df = date.fromisoformat(cfg.data_fim)
-        if di > df:
-            erros.append("data_inicio > data_fim (inverta as datas).")
-    except Exception:
-        erros.append("Datas inválidas. Use formato ISO: YYYY-MM-DD.")
 
-    if cfg.hora_inicio_utc is not None and str(cfg.hora_inicio_utc).strip() != "":
+    try:
+        datetime.fromisoformat(cfg.data_inicio)
+    except Exception:
+        erros.append("data_inicio inválida (use YYYY-MM-DD).")
+
+    try:
+        datetime.fromisoformat(cfg.data_fim)
+    except Exception:
+        erros.append("data_fim inválida (use YYYY-MM-DD).")
+
+    if cfg.hora_inicio_utc is not None:
         try:
-            hh, mm = str(cfg.hora_inicio_utc).strip().split(":")
+            hh, mm = cfg.hora_inicio_utc.split(":")
             hh = int(hh)
             mm = int(mm)
             if not (0 <= hh <= 23 and 0 <= mm <= 59):
-                raise ValueError
+                raise ValueError()
         except Exception:
-            erros.append("hora_inicio_utc inválida. Use HH:MM (ex.: 18:00) ou deixe vazio.")
+            erros.append("hora_inicio_utc inválida (use HH:MM).")
 
-    if cfg.step_min not in (5, 10, 15, 20, 30, 60):
-        erros.append("step_min inválido. Use 5, 10, 15, 20, 30 ou 60.")
-
-    if not (0 <= cfg.ALT_MIN < cfg.ALT_MAX <= 90):
-        erros.append("ALT_MIN/ALT_MAX inválidos (esperado 0 ≤ ALT_MIN < ALT_MAX ≤ 90).")
-
-    if not (10 <= cfg.V_MAX <= 22):
-        erros.append("V_MAX fora do razoável (esperado entre 10 e 22).")
-
+    if cfg.step_min <= 0:
+        erros.append("step_min deve ser > 0.")
+    if cfg.ALT_MIN >= cfg.ALT_MAX:
+        erros.append("ALT_MIN deve ser menor que ALT_MAX.")
+    if cfg.V_MAX <= 0:
+        erros.append("V_MAX deve ser > 0.")
     if cfg.LIMIAR_RAPIDO <= 0:
         erros.append("LIMIAR_RAPIDO deve ser > 0.")
 
-    if cfg.SOL_ALT_MAX is not None:
-        try:
-            sol = float(cfg.SOL_ALT_MAX)
-            if not (-90 <= sol <= 90):
-                erros.append("SOL_ALT_MAX fora do intervalo [-90, 90].")
-        except Exception:
-            erros.append("SOL_ALT_MAX deve ser numérico ou vazio.")
-
-    s = cfg.peso_recencia + cfg.peso_mag + cfg.peso_vel
-    if abs(s - 1.0) > 1e-6:
-        erros.append(f"Pesos do ranking devem somar 1.0 (atual = {s}).")
+    s = float(cfg.peso_recencia + cfg.peso_mag + cfg.peso_vel)
+    if not (0.0 < s <= 1.5):
+        erros.append("Pesos parecem inválidos. Ajuste peso_recencia/peso_mag/peso_vel.")
 
     return erros
 
 
 # =========================
-# JPL: leitura + nomes
+# IO / Run
 # =========================
-def ler_jpl_csvs(paths: List[Path]) -> Tuple[pd.DataFrame, List[str], Dict[str, Any]]:
-    aud: Dict[str, Any] = {}
-    if not paths:
-        raise FileNotFoundError("Nenhum CSV do JPL foi fornecido.")
-
-    rows: List[pd.DataFrame] = []
-    for p in paths:
-        if not p.exists():
-            raise FileNotFoundError(f"Arquivo não encontrado: {p}")
-        df = pd.read_csv(p)
-        rows.append(df)
-
-    df_all = pd.concat(rows, ignore_index=True)
-
-    candidatos = ["Object Name", "Object", "Target", "name", "Name"]
-    col_name = None
-    for c in candidatos:
-        if c in df_all.columns:
-            col_name = c
-            break
-    if col_name is None:
-        raise KeyError(f"Não encontrei coluna de nome no JPL. Colunas disponíveis: {list(df_all.columns)}")
-
-    nomes_raw = df_all[col_name].astype(str).tolist()
-    nomes_norm = [normalizar_nome_para_mpc(x) for x in nomes_raw]
-    nomes_norm = [x for x in nomes_norm if x]
-    lista_unica = sorted(pd.unique(nomes_norm).tolist())
-
-    aud["jpl_total_linhas"] = int(len(df_all))
-    aud["jpl_coluna_nome"] = col_name
-    aud["jpl_objetos_unicos"] = int(len(lista_unica))
-    aud["jpl_amostra_objetos"] = lista_unica[:15]
-
-    return df_all, lista_unica, aud
-
-
-def normalizar_nome_para_mpc(s: str) -> str:
-    """
-    Normalizações típicas:
-    - "(2025 XC2)" -> "2025 XC2"
-    - "21088 Chelyabinsk (1992 BL2)" -> "1992 BL2"
-    - "2025 WA3" mantém
-    """
-    if s is None:
-        return ""
-    t = str(s).strip()
-
-    m = None
-    if "(" in t and ")" in t:
-        m = list(pd.Series([t]).str.extract(r".*\(([^()]*)\)\s*$").iloc[0])[0]
-    if m and isinstance(m, str) and m.strip():
-        t = m.strip()
-
-    t = t.replace("(", "").replace(")", "").strip()
-    t = " ".join(t.split())
-    return t
-
-
-# =========================
-# MPC: aquisição (astroquery) — versão robusta + callback
-# =========================
-ProgressCB = Optional[Callable[[int, int, str, str], None]]
-# assinatura: (i_atual, total, objeto, fase) -> None
-
-
-def _montar_start_time(cfg: ConfigMissao) -> str:
-    """
-    Monta start como string/time do astropy, com hora UTC opcional.
-    """
-    if cfg.hora_inicio_utc and str(cfg.hora_inicio_utc).strip():
-        hhmm = str(cfg.hora_inicio_utc).strip()
-        return f"{cfg.data_inicio} {hhmm}"
-    return cfg.data_inicio
-
-
-def obter_mpc_astroquery(
-    lista_objetos: List[str],
-    cfg: ConfigMissao,
-    run_dir: Path,  # mantido por compatibilidade com o app (não usado aqui)
-    progress_cb: ProgressCB = None
-) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """
-    Baixa efemérides via astroquery.mpc com cache por objeto.
-    Retorna dataframe padronizado com colunas:
-      object, dt_utc, V, alt, mu_total ("/min), ano_desc
-    (Opcional) se o MPC retornar, também traz:
-      sun_alt
-    """
-    from astroquery.mpc import MPC
-    from astropy.time import Time
-    import astropy.units as u
-    import time
-
-    aud: Dict[str, Any] = {
-        "mpc_modo": "astroquery",
-        "objetos_entrada": int(len(lista_objetos)),
-        "objetos_cache": 0,
-        "objetos_baixados": 0,
-        "objetos_falha": 0,
-        "falhas": [],
-    }
-
-    cache_dir = Path(cfg.pasta_cache)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
-    # step robusto como Quantity
-    try:
-        step_min = float(cfg.step_min)
-    except Exception:
-        raise ValueError(f"cfg.step_min inválido: {cfg.step_min!r}. Deve ser numérico (minutos).")
-    if not np.isfinite(step_min) or step_min <= 0:
-        raise ValueError(f"cfg.step_min inválido: {cfg.step_min!r}. Deve ser > 0.")
-
-    step_q = float(step_min) * u.min
-
-    # start como astropy.time.Time (mais estável)
-    start_str = _montar_start_time(cfg)
-    start_t = Time(start_str)
-
-    aud["step_min_normalizado"] = step_min
-    aud["step_q"] = str(step_q)
-    aud["start_t_isot"] = str(start_t.isot)
-
-    # janela temporal e passos
-    di = datetime.fromisoformat(cfg.data_inicio)
-    df = datetime.fromisoformat(cfg.data_fim)
-    total_min = int((df - di).total_seconds() // 60)
-    n_steps = int(max(1, total_min // int(round(step_min)) + 1))
-    aud["n_steps"] = int(n_steps)
-
-    frames: List[pd.DataFrame] = []
-    t0_all = time.time()
-
-    total = int(len(lista_objetos))
-
-    # Lista de candidatos de colunas (MPC pode variar a nomenclatura)
-    time_candidates = ["Date", "Date (UT)", "UT", "Datetime", "date"]
-    v_candidates = ["V", "Mag", "mag", "Vmag"]
-    alt_candidates = ["Altitude", "Alt", "alt", "EL", "Elev"]
-    pm_candidates = [
-        "Proper motion",
-        "Proper Motion",
-        "PM",
-        "Motion",
-        "mu",
-        "Sky motion",
-        "Sky Motion",
-    ]
-    sun_candidates = ["Sun altitude", "Sun Altitude", "Sun alt", "SunAlt", "Sun_Altitude"]
-
-    for i, obj in enumerate(lista_objetos, start=1):
-        obj_clean = str(obj).strip()
-        if not obj_clean:
-            continue
-
-        if progress_cb:
-            progress_cb(i, total, obj_clean, "início")
-
-        cache_file = cache_dir / (
-            f"mpc_{obj_clean.replace(' ', '_')}_{cfg.data_inicio}_{cfg.data_fim}_{int(round(step_min))}min.parquet"
-        )
-
-        try:
-            if cache_file.exists():
-                df_obj = pd.read_parquet(cache_file)
-                aud["objetos_cache"] += 1
-                if progress_cb:
-                    progress_cb(i, total, obj_clean, "cache")
-            else:
-                last_err = None
-                df_obj = None
-
-                for attempt in range(1, 4):
-                    try:
-                        if progress_cb:
-                            progress_cb(i, total, obj_clean, f"baixando (tentativa {attempt}/3)")
-
-                        eph = MPC.get_ephemeris(
-                            obj_clean,
-                            location=str(cfg.observatorio).strip(),
-                            start=start_t,
-                            step=step_q,
-                            number=int(n_steps),
-                        )
-                        df_obj = eph.to_pandas()
-                        aud["objetos_baixados"] += 1
-                        break
-                    except Exception as e:
-                        last_err = str(e)
-                        time.sleep(1.5 * attempt)
-
-                if df_obj is None:
-                    raise RuntimeError(last_err or "Falha desconhecida ao consultar MPC.")
-
-                df_obj.to_parquet(cache_file, index=False)
-
-            if i == 1:
-                aud["colunas_retorno_mpc_exemplo"] = list(df_obj.columns)
-
-            # 1) tempo
-            time_col = next((c for c in time_candidates if c in df_obj.columns), None)
-            if time_col is None:
-                raise KeyError(f"{obj_clean}: não encontrei coluna de data/hora. Colunas: {list(df_obj.columns)}")
-
-            dt = pd.to_datetime(df_obj[time_col], errors="coerce", utc=True)
-            if dt.isna().all():
-                raise ValueError(
-                    f"{obj_clean}: datas não parsearam (coluna {time_col}). Amostra: {df_obj[time_col].head(3).tolist()}"
-                )
-
-            # 2) magnitude V
-            v_col = next((c for c in v_candidates if c in df_obj.columns), None)
-            if v_col is None:
-                raise KeyError(f"{obj_clean}: não encontrei coluna de magnitude V. Colunas: {list(df_obj.columns)}")
-            V = pd.to_numeric(df_obj[v_col], errors="coerce")
-
-            # 3) altitude (objeto)
-            alt_col = next((c for c in alt_candidates if c in df_obj.columns), None)
-            if alt_col is None:
-                raise KeyError(f"{obj_clean}: não encontrei coluna de altitude. Colunas: {list(df_obj.columns)}")
-            alt = pd.to_numeric(df_obj[alt_col], errors="coerce")
-
-            # 4) proper motion (módulo)
-            pm_col = next((c for c in pm_candidates if c in df_obj.columns), None)
-            if pm_col is None:
-                raise KeyError(f"{obj_clean}: não encontrei coluna de proper motion. Colunas: {list(df_obj.columns)}")
-            pm = pd.to_numeric(df_obj[pm_col], errors="coerce")
-
-            # unidade heurística "/h" vs "/min"
-            med = float(pm.dropna().median()) if pm.notna().any() else np.nan
-            if np.isfinite(med) and med > 50:
-                mu_total = pm / 60.0
-                unidade_assumida = '"/h → "/min'
-            else:
-                mu_total = pm.copy()
-                unidade_assumida = 'assumido "/min'
-
-            # (opcional) altura do Sol
-            sun_col = next((c for c in sun_candidates if c in df_obj.columns), None)
-            sun_alt = pd.to_numeric(df_obj[sun_col], errors="coerce") if sun_col else None
-
-            # ano de designação
-            ano_desc = pd.to_numeric(
-                pd.Series([obj_clean]).str.extract(r"(\d{4})")[0],
-                errors="coerce"
-            ).iloc[0]
-
-            out_dict: Dict[str, Any] = {
-                "object": obj_clean,
-                "dt_utc": dt.dt.tz_convert(None),  # datetime naive em UTC
-                "V": V,
-                "alt": alt,
-                "mu_total": mu_total,
-                "ano_desc": ano_desc,
-            }
-            if sun_alt is not None:
-                out_dict["sun_alt"] = sun_alt
-
-            out = pd.DataFrame(out_dict).dropna(subset=["dt_utc"])
-
-            if i == 1:
-                aud["pm_unidade_heuristica"] = unidade_assumida
-                if sun_col is not None:
-                    aud["sun_alt_col"] = sun_col
-
-            frames.append(out)
-
-            if progress_cb:
-                progress_cb(i, total, obj_clean, "ok")
-
-        except Exception as e:
-            aud["objetos_falha"] += 1
-            aud["falhas"].append({"object": obj_clean, "erro": str(e)})
-            if progress_cb:
-                progress_cb(i, total, obj_clean, "falha")
-
-    if not frames:
-        cols = ["object", "dt_utc", "V", "alt", "mu_total", "ano_desc"]
-        if cfg.SOL_ALT_MAX is not None:
-            cols.append("sun_alt")
-        return pd.DataFrame(columns=cols), aud
-
-    df_all = pd.concat(frames, ignore_index=True)
-
-    # garante dtype de dt_utc
-    df_all["dt_utc"] = pd.to_datetime(df_all["dt_utc"], errors="coerce")
-    df_all = df_all.dropna(subset=["dt_utc"]).reset_index(drop=True)
-
-    aud["linhas_mpc_total"] = int(len(df_all))
-    aud["objetos_com_dados"] = int(df_all["object"].nunique())
-    aud["tempo_total_s"] = round(time.time() - t0_all, 2)
-
-    aud["V_min"] = float(df_all["V"].min()) if df_all["V"].notna().any() else None
-    aud["V_max"] = float(df_all["V"].max()) if df_all["V"].notna().any() else None
-    aud["ALT_min"] = float(df_all["alt"].min()) if df_all["alt"].notna().any() else None
-    aud["ALT_max"] = float(df_all["alt"].max()) if df_all["alt"].notna().any() else None
-    aud["mu_med"] = float(df_all["mu_total"].median()) if df_all["mu_total"].notna().any() else None
-    aud["mu_max"] = float(df_all["mu_total"].max()) if df_all["mu_total"].notna().any() else None
-
-    if "sun_alt" in df_all.columns:
-        aud["SUN_ALT_min"] = float(df_all["sun_alt"].min()) if df_all["sun_alt"].notna().any() else None
-        aud["SUN_ALT_max"] = float(df_all["sun_alt"].max()) if df_all["sun_alt"].notna().any() else None
-    elif cfg.SOL_ALT_MAX is not None:
-        # você pediu filtro de Sol, mas o MPC não trouxe a coluna
-        aud["aviso_sol_alt"] = "SOL_ALT_MAX foi configurado, mas o MPC não retornou 'Sun altitude'. Filtro solar não aplicado."
-
-    return df_all, aud
-
-
-# =========================
-# Filtros + resumo + ranking
-# =========================
-def filtrar_epocas(df: pd.DataFrame, cfg: ConfigMissao) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    aud: Dict[str, Any] = {}
-    if df.empty:
-        aud["linhas_total"] = 0
-        return df, aud
-
-    aud["linhas_total"] = int(len(df))
-
-    mask_v = df["V"] <= cfg.V_MAX
-    mask_alt = (df["alt"] >= cfg.ALT_MIN) & (df["alt"] <= cfg.ALT_MAX)
-
-    # filtro opcional por Sol
-    if cfg.SOL_ALT_MAX is not None:
-        if "sun_alt" in df.columns:
-            sol_lim = float(cfg.SOL_ALT_MAX)
-            mask_sun = df["sun_alt"] <= sol_lim
-            aud["linhas_SOL_ok"] = int(mask_sun.sum())
-        else:
-            # não filtra, mas audita
-            mask_sun = pd.Series(True, index=df.index)
-            aud["linhas_SOL_ok"] = None
-            aud["aviso_sol_alt"] = "SOL_ALT_MAX configurado, mas df não tem coluna 'sun_alt'. Filtro solar não aplicado."
-    else:
-        mask_sun = pd.Series(True, index=df.index)
-        aud["linhas_SOL_ok"] = None
-
-    aud["linhas_V_ok"] = int(mask_v.sum())
-    aud["linhas_ALT_ok"] = int(mask_alt.sum())
-    aud["linhas_VeALT"] = int((mask_v & mask_alt).sum())
-
-    df_obs = (
-        df[mask_v & mask_alt & mask_sun]
-        .copy()
-        .sort_values(["object", "dt_utc"])
-        .reset_index(drop=True)
-    )
-    aud["linhas_VeALTeSOL"] = int(len(df_obs))
-    aud["objetos_obs"] = int(df_obs["object"].nunique()) if not df_obs.empty else 0
-    return df_obs, aud
-
-
-def classificar_velocidade(df_obs: pd.DataFrame, cfg: ConfigMissao) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
-    aud: Dict[str, Any] = {}
-    if df_obs.empty:
-        return df_obs, pd.DataFrame(columns=["object", "classe_objeto"]), {"objetos": 0}
-
-    df_obs = df_obs.copy()
-    df_obs["classe_linha"] = np.where(df_obs["mu_total"] >= cfg.LIMIAR_RAPIDO, "rápido", "lento")
-
-    classe_obj = (
-        df_obs.assign(eh_rapido=df_obs["mu_total"] >= cfg.LIMIAR_RAPIDO)
-        .groupby("object", as_index=False)["eh_rapido"]
-        .max()
-    )
-    classe_obj["classe_objeto"] = np.where(classe_obj["eh_rapido"], "rápido", "lento")
-    classe_obj = classe_obj[["object", "classe_objeto"]]
-
-    df_obs = df_obs.merge(classe_obj, on="object", how="left")
-
-    aud["objetos_total"] = int(df_obs["object"].nunique())
-    aud["rapidos_obj"] = int((classe_obj["classe_objeto"] == "rápido").sum())
-    aud["lentos_obj"] = int((classe_obj["classe_objeto"] == "lento").sum())
-    return df_obs, classe_obj, aud
-
-
-def resumir_por_objeto(df_obs: pd.DataFrame, cfg: ConfigMissao) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    aud: Dict[str, Any] = {}
-    if df_obs.empty:
-        return pd.DataFrame(), {"objetos": 0}
-
-    df_obs = df_obs.copy()
-    df_obs["date_utc"] = df_obs["dt_utc"].dt.date
-
-    rows: List[Dict[str, Any]] = []
-    for obj, g in df_obs.groupby("object", sort=True):
-        g = g.sort_values("dt_utc").reset_index(drop=True)
-        ini = g.iloc[0]
-        ultimo_dia = g["date_utc"].max()
-        primeiro_dia = g["date_utc"].min()
-        fim = g[g["date_utc"] == ultimo_dia].iloc[0]
-        best = g.loc[g["V"].idxmin()]
-
-        janela = f"{primeiro_dia.day:02d}–{ultimo_dia.day:02d}/{ultimo_dia.month:02d}"
-        deltaV = f"{float(ini['V']):.1f}–{float(fim['V']):.1f}"
-
-        nome_saida = obj + ("*" if ini["classe_objeto"] == "rápido" else "")
-
-        rows.append({
-            "Nome do objeto": nome_saida,
-            "Nome_limpo": obj,
-            "Melhores dias para observação": janela,
-            "ΔV-MAG (Início–Fim)": deltaV,
-            "Análise": cfg.ANALISE_PADRAO,
-            'μ ("/min) Início': float(ini["mu_total"]),
-            'μ ("/min) Fim': float(fim["mu_total"]),
-            "Classe": ini["classe_objeto"],
-            "Melhor dia (menor V)": best["dt_utc"].strftime("%Y-%m-%d"),
-            "V no melhor ponto": float(best["V"]),
-            "ALT no melhor ponto (deg)": float(best["alt"]),
-            "Ano": float(ini.get("ano_desc", np.nan)),
-        })
-
-    summary = pd.DataFrame(rows)
-    aud["objetos_resumo"] = int(len(summary))
-    return summary, aud
-
-
-def ranquear(summary: pd.DataFrame, cfg: ConfigMissao) -> pd.DataFrame:
-    df = summary.copy()
-
-    if "Ano" not in df.columns:
-        df["Ano"] = np.nan
-
-    if df["Ano"].isna().all():
-        df["Ano"] = df["Nome_limpo"].str.extract(r"(\d{4})").astype(float)
-
-    ano = df["Ano"]
-    if ano.notna().sum() >= 2:
-        min_y, max_y = float(ano.min()), float(ano.max())
-        df["score_recencia"] = (ano - min_y) / (max_y - min_y) if max_y > min_y else 0.0
-    else:
-        df["score_recencia"] = 0.0
-
-    v = df["V no melhor ponto"]
-    vmin, vmax = float(v.min()), float(v.max())
-    df["score_mag"] = 1 - (v - vmin) / (vmax - vmin) if vmax > vmin else 0.0
-
-    df["score_vel"] = df["Classe"].map({"rápido": 1.0, "lento": 0.0}).fillna(0.0)
-
-    df["score_total"] = (
-        cfg.peso_recencia * df["score_recencia"] +
-        cfg.peso_mag * df["score_mag"] +
-        cfg.peso_vel * df["score_vel"]
-    )
-
-    df = df.sort_values("score_total", ascending=False).reset_index(drop=True)
-    df.insert(0, "Prioridade", np.arange(1, len(df) + 1))
-    return df
-
-
 def criar_run_dir(cfg: ConfigMissao) -> Path:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = Path(cfg.pasta_runs) / f"run_{ts}"
@@ -585,3 +118,565 @@ def salvar_manifest(run_dir: Path, cfg: ConfigMissao, inputs: Dict[str, Any], au
     path = run_dir / "manifest.json"
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
     return path
+
+
+# =========================
+# Etapa 1 — Leitura JPL
+# =========================
+_JPL_NAME_CANDIDATES = ["Object Name", "Object", "Target", "name", "Name"]
+
+
+def _normalizar_nome_obj(s: str) -> str:
+    s = str(s).strip()
+    if not s:
+        return s
+    s = s.replace("(", "").replace(")", "").strip()
+    s = " ".join(s.split())
+    return s
+
+
+def ler_jpl_csvs(paths: List[Path]) -> Tuple[pd.DataFrame, List[str], Dict[str, Any]]:
+    aud: Dict[str, Any] = {"arquivos": [], "linhas_total": 0, "coluna_usada": None, "objetos_unicos": 0}
+    if not paths:
+        return pd.DataFrame(), [], {**aud, "erro": "Nenhum arquivo fornecido."}
+
+    dfs = []
+    for p in paths:
+        df = pd.read_csv(p)
+        dfs.append(df)
+        aud["arquivos"].append(p.name)
+        aud["linhas_total"] += int(len(df))
+
+    df_all = pd.concat(dfs, ignore_index=True)
+
+    col = None
+    for c in _JPL_NAME_CANDIDATES:
+        if c in df_all.columns:
+            col = c
+            break
+
+    if col is None:
+        return df_all, [], {**aud, "erro": f"Nenhuma coluna de nome encontrada. Candidatas: {_JPL_NAME_CANDIDATES}"}
+
+    aud["coluna_usada"] = col
+    df_all["Nome do objeto (JPL)"] = df_all[col].astype(str)
+    df_all["Nome_limpo"] = df_all["Nome do objeto (JPL)"].map(_normalizar_nome_obj)
+
+    lista_obj = (
+        df_all["Nome_limpo"]
+        .dropna()
+        .astype(str)
+        .map(str.strip)
+        .loc[lambda x: x != ""]
+        .unique()
+        .tolist()
+    )
+    aud["objetos_unicos"] = int(len(lista_obj))
+    return df_all, lista_obj, aud
+
+
+# =========================
+# Etapa 2 — MPC via astroquery + cache
+# =========================
+def _cache_key(cfg: ConfigMissao, obj: str) -> str:
+    base = json.dumps(
+        {
+            "obj": obj,
+            "obs": cfg.observatorio,
+            "ini": cfg.data_inicio,
+            "fim": cfg.data_fim,
+            "hora": cfg.hora_inicio_utc,
+            "step_min": cfg.step_min,
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha256(base.encode("utf-8")).hexdigest()[:16]
+
+
+def _parse_start_dt(cfg: ConfigMissao) -> datetime:
+    hhmm = cfg.hora_inicio_utc or "00:00"
+    t0 = f"{cfg.data_inicio}T{hhmm}:00"
+    return datetime.fromisoformat(t0)
+
+
+def _parse_end_dt(cfg: ConfigMissao) -> datetime:
+    hhmm = cfg.hora_inicio_utc or "00:00"
+    t1 = f"{cfg.data_fim}T{hhmm}:00"
+    return datetime.fromisoformat(t1)
+
+
+def _compute_number_epochs(cfg: ConfigMissao) -> int:
+    dt0 = _parse_start_dt(cfg)
+    dt1 = _parse_end_dt(cfg)
+    if dt1 < dt0:
+        return 0
+    step = max(1, int(cfg.step_min))
+    total_minutes = int((dt1 - dt0).total_seconds() // 60)
+    n = (total_minutes // step) + 1
+    return max(1, int(n))
+
+
+def _mpc_table_to_df(tbl) -> pd.DataFrame:
+    try:
+        return tbl.to_pandas()
+    except Exception:
+        try:
+            return pd.DataFrame({c: list(tbl[c]) for c in tbl.colnames})
+        except Exception:
+            return pd.DataFrame()
+
+
+def _standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    out = df.copy()
+    out.columns = [str(c).strip() for c in out.columns]
+
+    colmap_candidates = {
+        "V": ["V", "mag", "Mag", "Vmag"],
+        "Alt": ["Alt", "alt", "Altitude", "EL", "El", "elev", "Elevation"],
+        "SunAlt": ["SunAlt", "sunAlt", "SolAlt", "SunEl", "Sun_EL", "Sun_elev", "SunElevation"],
+        "dRA": ["dRA", "RA_rate", "ra_rate", "dRA/dt", "RA motion", "RA_motion"],
+        "dDec": ["dDec", "Dec_rate", "dec_rate", "dDec/dt", "Dec motion", "Dec_motion"],
+        "mu": ["mu", "pm", "ProperMotion", "proper_motion", "Sky motion", "sky_motion"],
+        "epoch": ["epoch", "Epoch", "Date", "date", "datetime", "Time", "time"],
+    }
+
+    for std, cands in colmap_candidates.items():
+        for c in cands:
+            if c in out.columns:
+                out.rename(columns={c: std}, inplace=True)
+                break
+
+    if "epoch" in out.columns:
+        out["epoch"] = pd.to_datetime(out["epoch"], errors="coerce")
+    else:
+        out["epoch"] = pd.NaT
+
+    for c in ["V", "Alt", "SunAlt", "dRA", "dDec", "mu"]:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+
+    return out
+
+
+def obter_mpc_astroquery(
+    lista_obj: List[str],
+    cfg: ConfigMissao,
+    run_dir: Path,
+    progress_cb: ProgressCB = None,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    aud: Dict[str, Any] = {
+        "total_objetos": int(len(lista_obj)),
+        "cache_hits": 0,
+        "baixados": 0,
+        "falhas": [],
+        "mpc_mode": "start_step_number",
+        "proper_motion_unit": None,
+        "step_quantity": None,
+    }
+
+    if not lista_obj:
+        return pd.DataFrame(), {**aud, "erro": "lista_obj vazia."}
+
+    cache_dir = Path(cfg.pasta_cache)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        from astroquery.mpc import MPC  # type: ignore
+    except Exception as e:
+        return pd.DataFrame(), {**aud, "erro": f"astroquery.mpc indisponível: {e}"}
+
+    start_dt = _parse_start_dt(cfg)
+    number = _compute_number_epochs(cfg)
+    location = str(cfg.observatorio)
+
+    # ✅ FIX: step como Quantity (astropy.units)
+    step_q = int(cfg.step_min) * u.minute
+    aud["step_quantity"] = str(step_q)
+
+    # Vamos tentar proper motion em arcsec/min; se não aceitar, caímos em arcsec/h e convertemos.
+    proper_motion_unit_tried = ["arcsec/min", "arcsec/h"]
+
+    total = max(1, len(lista_obj))
+    all_rows: List[pd.DataFrame] = []
+
+    for i, obj in enumerate(lista_obj, start=1):
+        if progress_cb:
+            progress_cb(i, total, obj, "cache/check")
+
+        key = _cache_key(cfg, obj)
+        safe_name = obj.replace("/", "_").replace(" ", "_")
+        p_cache = cache_dir / f"mpc_{safe_name}_{key}.parquet"
+
+        if p_cache.exists():
+            try:
+                df_obj = pd.read_parquet(p_cache)
+                aud["cache_hits"] += 1
+                all_rows.append(df_obj)
+                continue
+            except Exception:
+                pass
+
+        if progress_cb:
+            progress_cb(i, total, obj, "download")
+
+        last_err = None
+        df_obj = None
+        used_unit = None
+
+        for pm_unit in proper_motion_unit_tried:
+            try:
+                tbl = MPC.get_ephemeris(
+                    target=obj,
+                    location=location,
+                    start=start_dt.isoformat(sep=" "),
+                    step=step_q,          # ✅ Quantity
+                    number=number,
+                    proper_motion="total",
+                    proper_motion_unit=pm_unit,
+                    cache=False,
+                )
+                used_unit = pm_unit
+                df_obj = _standardize_columns(_mpc_table_to_df(tbl))
+                break
+            except Exception as e:
+                last_err = e
+                df_obj = None
+
+        if df_obj is None or df_obj.empty:
+            aud["falhas"].append({"object": obj, "erro": str(last_err) if last_err else "Falha desconhecida"})
+            continue
+
+        df_obj["Nome_limpo"] = obj
+
+        # se veio mu em arcsec/h, converte para arcsec/min (padrão interno)
+        if "mu" in df_obj.columns and used_unit == "arcsec/h":
+            df_obj["mu"] = df_obj["mu"] / 60.0
+
+        aud["proper_motion_unit"] = used_unit
+        aud["baixados"] += 1
+
+        try:
+            df_obj.to_parquet(p_cache, index=False)
+        except Exception:
+            pass
+
+        all_rows.append(df_obj)
+
+    if not all_rows:
+        return pd.DataFrame(), aud
+
+    df_all = pd.concat(all_rows, ignore_index=True)
+
+    if "epoch" not in df_all.columns:
+        df_all["epoch"] = pd.NaT
+    else:
+        df_all["epoch"] = pd.to_datetime(df_all["epoch"], errors="coerce")
+
+    return df_all, aud
+
+
+# =========================
+# Etapa 3 — Filtros / Classe / Resumo / Ranking
+# =========================
+def filtrar_epocas(df_mpc: pd.DataFrame, cfg: ConfigMissao) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    aud: Dict[str, Any] = {
+        "linhas_entrada": int(len(df_mpc)) if df_mpc is not None else 0,
+        "filtro_V_aplicado": False,
+        "filtro_ALT_aplicado": False,
+        "filtro_Sol_aplicado": False,
+        "linhas_saida": 0,
+        "avisos": [],
+    }
+
+    if df_mpc is None or df_mpc.empty:
+        return pd.DataFrame(), {**aud, "avisos": ["df_mpc vazio."]}
+
+    df = df_mpc.copy()
+
+    if "V" in df.columns:
+        aud["filtro_V_aplicado"] = True
+        df = df[df["V"].notna() & (df["V"] <= float(cfg.V_MAX))]
+    else:
+        aud["avisos"].append("Coluna 'V' não encontrada; filtro de magnitude não aplicado.")
+
+    if "Alt" in df.columns:
+        aud["filtro_ALT_aplicado"] = True
+        df = df[df["Alt"].notna() & (df["Alt"] >= float(cfg.ALT_MIN)) & (df["Alt"] <= float(cfg.ALT_MAX))]
+    else:
+        aud["avisos"].append("Coluna 'Alt' não encontrada; filtros de altitude não aplicados.")
+
+    if cfg.SOL_ALT_MAX is not None:
+        if "SunAlt" in df.columns:
+            aud["filtro_Sol_aplicado"] = True
+            df = df[df["SunAlt"].notna() & (df["SunAlt"] <= float(cfg.SOL_ALT_MAX))]
+        else:
+            aud["avisos"].append("SOL_ALT_MAX definido, mas coluna 'SunAlt' não existe; filtro do Sol não aplicado.")
+
+    aud["linhas_saida"] = int(len(df))
+    return df.reset_index(drop=True), aud
+
+
+def classificar_velocidade(df_obs: pd.DataFrame, cfg: ConfigMissao) -> Tuple[pd.DataFrame, Dict[str, str], Dict[str, Any]]:
+    aud: Dict[str, Any] = {
+        "linhas_entrada": int(len(df_obs)) if df_obs is not None else 0,
+        "modo_velocidade": None,
+        "limiar_rapido": float(cfg.LIMIAR_RAPIDO),
+        "linhas_com_vel": 0,
+        "avisos": [],
+    }
+    classe_obj: Dict[str, str] = {}
+
+    if df_obs is None or df_obs.empty:
+        return pd.DataFrame(), classe_obj, {**aud, "avisos": ["df_obs vazio."]}
+
+    df = df_obs.copy()
+
+    if "mu" in df.columns and df["mu"].notna().any():
+        df["mu_total"] = df["mu"]
+        aud["modo_velocidade"] = "mu_total"
+    elif ("dRA" in df.columns and "dDec" in df.columns) and (df["dRA"].notna().any() or df["dDec"].notna().any()):
+        df["mu_total"] = np.sqrt(df["dRA"].fillna(0.0) ** 2 + df["dDec"].fillna(0.0) ** 2)
+        aud["modo_velocidade"] = "componentes(dRA,dDec)"
+    else:
+        df["mu_total"] = np.nan
+        aud["modo_velocidade"] = "indisponivel"
+        aud["avisos"].append("Sem colunas de velocidade (mu ou dRA/dDec). Classificação rápido/lento não aplicada.")
+
+    aud["linhas_com_vel"] = int(df["mu_total"].notna().sum())
+
+    lim = float(cfg.LIMIAR_RAPIDO)
+    df["Classe_vel"] = np.where(
+        df["mu_total"].notna() & (df["mu_total"] > lim),
+        "rapido",
+        np.where(df["mu_total"].notna(), "lento", "desconhecida"),
+    )
+
+    if "Nome_limpo" in df.columns:
+        for obj, g in df.groupby("Nome_limpo"):
+            counts = g["Classe_vel"].value_counts(dropna=False)
+            classe_obj[str(obj)] = str(counts.idxmax()) if len(counts) else "desconhecida"
+
+    return df.reset_index(drop=True), classe_obj, aud
+
+
+def resumir_por_objeto(df_obs: pd.DataFrame, cfg: ConfigMissao) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    aud: Dict[str, Any] = {"objetos": 0, "avisos": []}
+    if df_obs is None or df_obs.empty:
+        return pd.DataFrame(), {**aud, "avisos": ["df_obs vazio."]}
+
+    if "Nome_limpo" not in df_obs.columns:
+        return pd.DataFrame(), {**aud, "avisos": ["Coluna Nome_limpo ausente."]}
+
+    df = df_obs.copy()
+    agg: Dict[str, Tuple[str, str]] = {}
+
+    if "V" in df.columns:
+        agg["V_min"] = ("V", "min")
+        agg["V_med"] = ("V", "median")
+    else:
+        df["V"] = np.nan
+        agg["V_min"] = ("V", "min")
+        agg["V_med"] = ("V", "median")
+        aud["avisos"].append("Sem coluna V; V_min/V_med serão NaN.")
+
+    if "Alt" in df.columns:
+        agg["ALT_max"] = ("Alt", "max")
+        agg["ALT_med"] = ("Alt", "median")
+    else:
+        df["Alt"] = np.nan
+        agg["ALT_max"] = ("Alt", "max")
+        agg["ALT_med"] = ("Alt", "median")
+        aud["avisos"].append("Sem coluna Alt; ALT_max/ALT_med serão NaN.")
+
+    if "mu_total" in df.columns:
+        agg["mu_med"] = ("mu_total", "median")
+        agg["mu_max"] = ("mu_total", "max")
+    else:
+        df["mu_total"] = np.nan
+        agg["mu_med"] = ("mu_total", "median")
+        agg["mu_max"] = ("mu_total", "max")
+        aud["avisos"].append("Sem mu_total; mu_med/mu_max serão NaN.")
+
+    agg["n_epocas"] = ("Nome_limpo", "size")
+
+    if "epoch" in df.columns:
+        agg["epoch_min"] = ("epoch", "min")
+        agg["epoch_max"] = ("epoch", "max")
+    else:
+        df["epoch"] = pd.NaT
+        agg["epoch_min"] = ("epoch", "min")
+        agg["epoch_max"] = ("epoch", "max")
+
+    out = df.groupby("Nome_limpo", dropna=False).agg(**agg).reset_index()
+    out["Nome do objeto"] = out["Nome_limpo"]
+
+    aud["objetos"] = int(len(out))
+    return out, aud
+
+
+def ranquear(summary: pd.DataFrame, cfg: ConfigMissao) -> pd.DataFrame:
+    if summary is None or summary.empty:
+        return pd.DataFrame()
+
+    df = summary.copy()
+
+    v = pd.to_numeric(df["V_min"], errors="coerce")
+    if v.notna().any():
+        v_norm = (v.max() - v) / (v.max() - v.min() + 1e-9)
+        v_norm = v_norm.fillna(0.0)
+    else:
+        v_norm = pd.Series(0.0, index=df.index)
+    df["score_mag"] = v_norm
+
+    mu = pd.to_numeric(df["mu_med"], errors="coerce")
+    if mu.notna().any():
+        mu_norm = (mu.max() - mu) / (mu.max() - mu.min() + 1e-9)
+        mu_norm = mu_norm.fillna(0.0)
+    else:
+        mu_norm = pd.Series(0.0, index=df.index)
+    df["score_vel"] = mu_norm
+
+    t = pd.to_datetime(df["epoch_max"], errors="coerce")
+    if t.notna().any():
+        t_ord = t.map(lambda x: x.timestamp() if pd.notna(x) else np.nan).astype(float)
+        t_norm = (t_ord - np.nanmin(t_ord)) / (np.nanmax(t_ord) - np.nanmin(t_ord) + 1e-9)
+        t_norm = pd.Series(t_norm, index=df.index).fillna(0.0)
+    else:
+        t_norm = pd.Series(0.0, index=df.index)
+    df["score_recencia"] = t_norm
+
+    df["score_total"] = (
+        float(cfg.peso_recencia) * df["score_recencia"]
+        + float(cfg.peso_mag) * df["score_mag"]
+        + float(cfg.peso_vel) * df["score_vel"]
+    )
+
+    df = df.sort_values("score_total", ascending=False).reset_index(drop=True)
+    df.insert(0, "Prioridade", np.arange(1, len(df) + 1))
+    return df
+
+
+# =========================
+# Taxonomia (ROCKS) — enriquecimento opcional pós-Etapa 3
+# =========================
+def _pick_first_nonempty(data: Dict[str, Any], keys: List[str]) -> Optional[str]:
+    for k in keys:
+        v = data.get(k)
+        if v is not None and str(v).strip() != "":
+            return str(v).strip()
+    return None
+
+
+def _extract_taxonomy_info(payload: Any) -> Tuple[bool, Optional[str], Optional[str], Any]:
+    if payload is None:
+        return False, None, None, None
+
+    if isinstance(payload, list):
+        if len(payload) == 0:
+            return False, None, None, []
+        first = payload[0]
+        if isinstance(first, dict):
+            classe = _pick_first_nonempty(first, ["class", "name", "value", "label", "type"])
+            fonte = _pick_first_nonempty(first, ["source", "reference", "ref", "bibcode"])
+            return classe is not None, classe, fonte, payload
+        return True, str(first), None, payload
+
+    if isinstance(payload, dict):
+        classe = _pick_first_nonempty(payload, ["class", "name", "value", "label", "type", "taxonomy"])
+        fonte = _pick_first_nonempty(payload, ["source", "reference", "ref", "bibcode"])
+        return classe is not None, classe, fonte, payload
+
+    text = str(payload).strip()
+    return bool(text), text if text else None, None, text
+
+
+def _query_taxonomy_with_rocks(object_name: str) -> Dict[str, Any]:
+    try:
+        rocks_mod = importlib.import_module("rocks")
+    except Exception:
+        return {
+            "status": "rocks_unavailable",
+            "has_taxonomy": False,
+            "taxonomy_class": None,
+            "taxonomy_source": None,
+            "taxonomy_raw": None,
+            "error": "Pacote 'rocks' não está disponível no ambiente.",
+        }
+
+    try:
+        rock_obj = rocks_mod.Rock(object_name)
+        tax_payload = getattr(rock_obj, "taxonomy", None)
+        has_tax, tax_class, tax_source, tax_raw = _extract_taxonomy_info(tax_payload)
+        return {
+            "status": "ok",
+            "has_taxonomy": has_tax,
+            "taxonomy_class": tax_class,
+            "taxonomy_source": tax_source,
+            "taxonomy_raw": tax_raw,
+            "error": None,
+        }
+    except Exception as e:
+        return {
+            "status": "query_error",
+            "has_taxonomy": False,
+            "taxonomy_class": None,
+            "taxonomy_source": None,
+            "taxonomy_raw": None,
+            "error": str(e),
+        }
+
+
+def enriquecer_taxonomia_rocks(
+    ranked: pd.DataFrame,
+    progress_cb: ProgressCB = None,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    aud: Dict[str, Any] = {
+        "objetos_entrada": 0,
+        "objetos_consultados": 0,
+        "objetos_com_taxonomia": 0,
+        "objetos_sem_taxonomia": 0,
+        "falhas": [],
+        "rocks_disponivel": None,
+    }
+
+    if ranked is None or ranked.empty:
+        return pd.DataFrame(), aud
+
+    if "Nome_limpo" not in ranked.columns:
+        raise KeyError("Tabela ranqueada sem coluna 'Nome_limpo'.")
+
+    df = ranked.copy()
+    objs = df["Nome_limpo"].astype(str).str.strip().dropna().unique().tolist()
+    aud["objetos_entrada"] = int(len(objs))
+
+    cache: Dict[str, Dict[str, Any]] = {}
+    total = max(1, len(objs))
+
+    for i, obj in enumerate(objs, start=1):
+        if progress_cb:
+            progress_cb(i, total, obj, "taxonomia")
+
+        res = _query_taxonomy_with_rocks(obj)
+        cache[obj] = res
+        aud["objetos_consultados"] += 1
+
+        if res.get("status") != "ok":
+            aud["falhas"].append({"object": obj, "erro": res.get("error"), "status": res.get("status")})
+
+    df["Taxonomia disponível"] = df["Nome_limpo"].map(
+        lambda x: bool(cache.get(str(x).strip(), {}).get("has_taxonomy", False))
+    )
+    df["Classe taxonômica"] = df["Nome_limpo"].map(
+        lambda x: cache.get(str(x).strip(), {}).get("taxonomy_class")
+    )
+    df["Fonte taxonomia"] = df["Nome_limpo"].map(
+        lambda x: cache.get(str(x).strip(), {}).get("taxonomy_source")
+    )
+
+    aud["objetos_com_taxonomia"] = int(df[df["Taxonomia disponível"]]["Nome_limpo"].nunique())
+    aud["objetos_sem_taxonomia"] = int(df[~df["Taxonomia disponível"]]["Nome_limpo"].nunique())
+    aud["rocks_disponivel"] = len([f for f in aud["falhas"] if f.get("status") == "rocks_unavailable"]) == 0
+    return df, aud
