@@ -1,53 +1,33 @@
 # NEO Mission Pipeline (Y28)
 
-Aplicativo Streamlit para seleção e priorização de NEOs (Near-Earth Objects) para planejamento de observações astronômicas pelo Y28/OASI.
+Aplicativo Streamlit para selecionar candidatos de NEOs para estudo de cores no Y28/OASI.
 
-O projeto foi pensado para apoiar a escolha de alvos observáveis em janelas específicas, com base em efemérides, magnitude aparente, altitude, velocidade angular e critérios operacionais de missão.
+A lógica principal é:
 
----
+1. ler uma lista inicial de objetos;
+2. buscar efemérides no MPC;
+3. avaliar as janelas noturnas de observação, por padrão das 21:00 às 08:00 UTC;
+4. ranquear apenas bons candidatos observacionais;
+5. consultar taxonomia publicada via ROCKS somente nos melhores candidatos;
+6. exportar a lista de objetos sem taxonomia encontrada para Eddie levar ao coordenador.
 
-## O que o projeto faz
-
-A pipeline executa cinco blocos principais:
-
-1. **Leitura JPL**  
-   Lê um ou mais CSVs exportados do JPL e normaliza os nomes dos objetos.
-
-2. **Consulta automática ao MPC**  
-   Usa `astroquery.mpc` para consultar efemérides dos objetos para o observatório definido, por padrão `Y28`.
-
-3. **Filtros + classificação + ranking**  
-   Filtra as efemérides por magnitude, altitude, altitude solar opcional e velocidade angular. Em seguida, resume os objetos e gera uma tabela ranqueada.
-
-4. **Taxonomia publicada via ROCKS (opcional)**  
-   Consulta informações taxonômicas publicadas usando o pacote `rocks`, quando disponível no ambiente.
-
-5. **Pós-ESA (opcional)**  
-   Permite cruzar a tabela ranqueada com uma lista final de objetos pós-seleção externa.
-
-Cada execução salva auditoria completa em:
-
-```text
-runs/run_<timestamp>/manifest.json
-```
+O objetivo não é montar toda a tabela final da campanha. O objetivo é entregar uma lista limpa de objetos para cores, com informações suficientes para o coordenador incorporar esses alvos à tabela geral da missão.
 
 ---
 
 ## Instalação
 
-Crie e ative um ambiente virtual:
-
 ```bash
 python -m venv .venv
 ```
 
-No Linux/macOS:
+Linux/macOS:
 
 ```bash
 source .venv/bin/activate
 ```
 
-No Windows PowerShell:
+Windows PowerShell:
 
 ```powershell
 .venv\Scripts\Activate.ps1
@@ -63,130 +43,152 @@ pip install -r requirements.txt
 
 ## Como executar
 
-Na pasta raiz do projeto, rode:
-
 ```bash
 streamlit run app.py
 ```
 
-O navegador abrirá a interface do aplicativo.
-
 ---
 
-## Arquivos de entrada
+## Entrada
 
-O app espera um ou mais arquivos CSV exportados do JPL.
-
-A pipeline procura automaticamente uma coluna de nome do objeto entre as seguintes opções:
+O app recebe um ou mais CSVs com nomes de objetos. A leitura procura automaticamente colunas como:
 
 ```text
 Object Name, Object, Target, name, Name
 ```
 
-Os nomes são normalizados removendo parênteses e espaços duplicados. Exemplos:
+Os nomes são normalizados removendo parênteses e espaços duplicados.
+
+---
+
+## Janela de observação
+
+A campanha é avaliada por noite. Por padrão, cada noite vai de:
 
 ```text
-(433) Eros  ->  433 Eros
-2024 AB     ->  2024 AB
+21:00 UTC até 08:00 UTC do dia seguinte
+```
+
+Isso é importante porque altitude, magnitude, fase e velocidade aparente podem variar de uma noite para outra. Por isso o app gera uma tabela específica de janelas por noite.
+
+---
+
+## Fluxo no app
+
+### Etapa 1 - Ler lista de objetos
+
+Lê e normaliza os objetos enviados por CSV.
+
+### Etapa 2 - Buscar efemérides MPC
+
+Consulta o MPC para cobrir todas as noites da missão. Internamente, o app amplia a consulta até a manhã posterior à última noite para cobrir corretamente janelas 21:00-08:00 UTC.
+
+### Etapa 3 - Avaliar janelas por noite
+
+Filtra as efemérides por:
+
+- magnitude aparente;
+- altura mínima e máxima;
+- altura do Sol, se configurada;
+- janela noturna;
+- duração mínima da janela.
+
+Depois resume cada objeto por noite e classifica a qualidade da noite como:
+
+```text
+Boa
+Regular
+Ruim
+```
+
+### Etapa 4 - Verificar taxonomia publicada via ROCKS
+
+Para reduzir o trabalho, o app consulta o ROCKS apenas nos melhores candidatos observacionais, e não em toda a lista inicial.
+
+### Etapa 5 - Gerar produtos finais
+
+Gera a lista principal de candidatos para estudo de cores e uma tabela auxiliar para o coordenador.
+
+---
+
+## Arquivos de saída
+
+Os principais arquivos gerados em `runs/run_<timestamp>/outputs/` são:
+
+```text
+janelas_por_noite_eddie.csv
+ranking_observacional_cores.csv
+ranking_com_taxonomia_rocks.csv
+candidatos_cores_eddie.csv
+apoio_coordenador_eddie.csv
+```
+
+### `janelas_por_noite_eddie.csv`
+
+Mostra a variação por noite:
+
+- objeto;
+- noite UTC;
+- início e fim da janela;
+- duração;
+- magnitude inicial/final/mínima;
+- altura inicial/final/máxima;
+- fase inicial/final, quando disponível;
+- velocidade angular;
+- velocidades em AR e DEC, quando disponíveis;
+- qualidade da noite.
+
+### `ranking_observacional_cores.csv`
+
+Mostra os melhores objetos observacionais antes da consulta de taxonomia.
+
+### `ranking_com_taxonomia_rocks.csv`
+
+Mostra o ranking observacional enriquecido com o resultado da consulta ROCKS.
+
+### `candidatos_cores_eddie.csv`
+
+Produto principal do projeto. Por padrão, contém apenas objetos sem taxonomia publicada encontrada.
+
+### `apoio_coordenador_eddie.csv`
+
+Tabela auxiliar com colunas próximas da tabela geral de campanha, incluindo:
+
+```text
+OBJETOS, D(Km), Prot(h), Porb(yr), H, Type, tp, Spectral, Albedo,
+alpha_o, mo, v_ar_o, v_dec_o, alpha_f, mf, v_ar_f, v_dec_f,
+Projects, Tipo_projeto, Filtros_sugeridos, Melhor_noite, Janela_UTC
+```
+
+Quando uma informação não é encontrada, o app preenche com `?`.
+
+---
+
+## Interpretação da taxonomia
+
+A consulta ROCKS é usada para identificar estudos prévios de taxonomia/cores. A regra operacional adotada é:
+
+```text
+Sem taxonomia encontrada  -> Candidato para cores
+Com taxonomia encontrada  -> Baixa prioridade/remover da lista principal
+Consulta inconclusiva     -> Verificar manualmente
 ```
 
 ---
 
-## Parâmetros principais
+## Observações importantes
 
-Na barra lateral do app é possível configurar:
-
-- **Observatório**: código MPC do observatório. O padrão é `Y28`.
-- **Data início / Data fim**: intervalo da missão em formato `YYYY-MM-DD`.
-- **Hora início UTC**: opcional, em formato `HH:MM`.
-- **Step (min)**: passo temporal das efemérides.
-- **ALT_MIN / ALT_MAX**: limites de altitude do objeto em graus.
-- **V_MAX**: magnitude aparente máxima permitida.
-- **SOL_ALT_MAX**: filtro opcional para céu escuro. Exemplos: `-18` para noite astronômica, `-12` para noite náutica e `-6` para noite civil.
-- **Limiar rápido**: velocidade angular em arcsec/min usada para classificar objetos como lentos ou rápidos.
-- **Pesos do ranking**: controle da importância relativa de recência, magnitude e velocidade.
-
----
-
-## Saídas geradas
-
-Cada execução cria uma pasta em:
-
-```text
-runs/run_<timestamp>/
-```
-
-Com subpastas:
-
-```text
-inputs/
-outputs/
-logs/
-```
-
-Os principais arquivos de saída são:
-
-```text
-outputs/neos_tabela_geral.csv
-outputs/neos_tabela_geral_taxonomia.csv
-outputs/neos_tabela_pos_esa.csv
-manifest.json
-```
-
-Nem todos os arquivos serão gerados em todas as execuções. Por exemplo, a tabela com taxonomia só é criada quando a etapa ROCKS é executada.
-
----
-
-## Como o ranking funciona hoje
-
-O ranking atual usa três componentes principais:
-
-- **Magnitude**: objetos mais brilhantes recebem maior prioridade.
-- **Velocidade angular**: objetos mais lentos recebem maior prioridade, pois tendem a ser mais fáceis de acompanhar e menos sujeitos a trailing.
-- **Recência**: objetos com melhor janela mais próxima do fim do intervalo recebem maior peso, conforme o critério implementado.
-
-O score final é calculado por uma soma ponderada:
-
-```text
-score_total = peso_recencia * score_recencia
-            + peso_mag      * score_mag
-            + peso_vel      * score_vel
-```
-
----
-
-## Observação científica importante
-
-No estado atual, o app deve ser entendido principalmente como uma pipeline de **priorização observacional de NEOs**.
-
-Para se tornar uma pipeline completa de **seleção para fotometria multibanda em cores**, ainda é recomendável incorporar critérios adicionais, como:
-
-- tempo necessário para sequência Sloan, por exemplo `g' r' i' r' z' r'`;
-- janela mínima para completar a sequência multibanda;
-- estimativa de trailing em função da velocidade angular e do tempo de exposição;
-- relação sinal-ruído esperada por filtro;
-- distância angular da Lua e fase lunar;
-- cálculo posterior de cores, refletância relativa e classificação taxonômica fotométrica.
-
----
-
-## Taxonomia
-
-A etapa ROCKS consulta taxonomias já publicadas, quando disponíveis. Portanto, essa etapa não deve ser confundida com classificação taxonômica obtida a partir das cores observadas pelo próprio projeto.
-
-Recomenda-se distinguir:
-
-1. **Taxonomia publicada via ROCKS**: informação externa já existente.
-2. **Taxonomia fotométrica futura**: classificação inferida a partir de cores Sloan medidas pelo projeto.
+- O app prioriza reduzir trabalho: primeiro filtra bons objetos observáveis, depois consulta ROCKS.
+- A tabela final da campanha continua sendo responsabilidade do coordenador.
+- O app entrega os objetos de Eddie já organizados para estudo de cores.
+- Algumas propriedades físicas, como diâmetro, albedo e período de rotação, podem não estar disponíveis. Nesses casos, a saída usa `?`.
 
 ---
 
 ## Próximos desenvolvimentos recomendados
 
-- Melhorar a leitura dos CSVs para aceitar automaticamente `,` e `;`.
-- Validar se `data_fim` é posterior ou igual a `data_inicio`.
-- Incluir score de janela observacional usando `n_epocas` ou duração da janela.
-- Incluir score de altitude usando `ALT_med` ou `ALT_max`.
-- Registrar de forma mais detalhada os arquivos gerados no `manifest.json`.
-- Criar uma pasta `examples/` com CSV de teste.
-- Implementar módulo específico para viabilidade de sequência Sloan.
+- Verificar se o MPC retorna sempre as componentes de velocidade em AR e DEC para todos os objetos.
+- Melhorar a extração de propriedades físicas do ROCKS conforme o formato real dos retornos.
+- Incluir distância angular da Lua e fase lunar.
+- Incluir estimativa de trailing por tempo de exposição.
+- Adicionar um CSV de exemplo em `examples/`.
