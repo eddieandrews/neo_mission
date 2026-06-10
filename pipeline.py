@@ -58,16 +58,21 @@ class ConfigMissao:
 
 def validar_cfg(cfg: ConfigMissao) -> List[str]:
     erros: List[str] = []
+    dt_inicio: Optional[datetime] = None
+    dt_fim: Optional[datetime] = None
 
     try:
-        datetime.fromisoformat(cfg.data_inicio)
+        dt_inicio = datetime.fromisoformat(cfg.data_inicio)
     except Exception:
         erros.append("data_inicio inválida (use YYYY-MM-DD).")
 
     try:
-        datetime.fromisoformat(cfg.data_fim)
+        dt_fim = datetime.fromisoformat(cfg.data_fim)
     except Exception:
         erros.append("data_fim inválida (use YYYY-MM-DD).")
+
+    if dt_inicio is not None and dt_fim is not None and dt_fim < dt_inicio:
+        erros.append("data_fim deve ser maior ou igual à data_inicio.")
 
     if cfg.hora_inicio_utc is not None:
         try:
@@ -124,6 +129,14 @@ def salvar_manifest(run_dir: Path, cfg: ConfigMissao, inputs: Dict[str, Any], au
 # Etapa 1 — Leitura JPL
 # =========================
 _JPL_NAME_CANDIDATES = ["Object Name", "Object", "Target", "name", "Name"]
+_CSV_READ_ATTEMPTS = [
+    {"sep": ",", "encoding": "utf-8"},
+    {"sep": ";", "encoding": "utf-8"},
+    {"sep": ",", "encoding": "utf-8-sig"},
+    {"sep": ";", "encoding": "utf-8-sig"},
+    {"sep": ",", "encoding": "latin1"},
+    {"sep": ";", "encoding": "latin1"},
+]
 
 
 def _normalizar_nome_obj(s: str) -> str:
@@ -135,17 +148,65 @@ def _normalizar_nome_obj(s: str) -> str:
     return s
 
 
+def _ler_csv_robusto(path: Path) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """Lê CSV tentando separadores e encodings comuns em exports JPL/planilhas."""
+    erros: List[str] = []
+    melhor_df: Optional[pd.DataFrame] = None
+    melhor_meta: Dict[str, Any] = {}
+    melhor_score = -1
+
+    for tentativa in _CSV_READ_ATTEMPTS:
+        try:
+            df = pd.read_csv(path, **tentativa)
+            score = int(len(df.columns))
+
+            if score > melhor_score:
+                melhor_df = df
+                melhor_meta = {"sep": tentativa["sep"], "encoding": tentativa["encoding"]}
+                melhor_score = score
+
+            if any(c in df.columns for c in _JPL_NAME_CANDIDATES):
+                return df, {**melhor_meta, "status": "ok"}
+        except Exception as e:
+            erros.append(f"sep={tentativa['sep']} encoding={tentativa['encoding']}: {e}")
+
+    if melhor_df is not None:
+        return melhor_df, {
+            **melhor_meta,
+            "status": "ok_sem_coluna_nome_confirmada",
+            "avisos": ["CSV lido, mas nenhuma coluna candidata de nome foi confirmada nessa etapa."],
+        }
+
+    raise ValueError("Falha ao ler CSV. Tentativas: " + " | ".join(erros))
+
+
 def ler_jpl_csvs(paths: List[Path]) -> Tuple[pd.DataFrame, List[str], Dict[str, Any]]:
-    aud: Dict[str, Any] = {"arquivos": [], "linhas_total": 0, "coluna_usada": None, "objetos_unicos": 0}
+    aud: Dict[str, Any] = {
+        "arquivos": [],
+        "linhas_total": 0,
+        "coluna_usada": None,
+        "objetos_unicos": 0,
+        "leituras": [],
+        "falhas_leitura": [],
+    }
     if not paths:
         return pd.DataFrame(), [], {**aud, "erro": "Nenhum arquivo fornecido."}
 
     dfs = []
     for p in paths:
-        df = pd.read_csv(p)
+        try:
+            df, meta = _ler_csv_robusto(p)
+        except Exception as e:
+            aud["falhas_leitura"].append({"arquivo": p.name, "erro": str(e)})
+            continue
+
         dfs.append(df)
         aud["arquivos"].append(p.name)
+        aud["leituras"].append({"arquivo": p.name, **meta, "linhas": int(len(df)), "colunas": list(map(str, df.columns))})
         aud["linhas_total"] += int(len(df))
+
+    if not dfs:
+        return pd.DataFrame(), [], {**aud, "erro": "Nenhum CSV pôde ser lido com sucesso."}
 
     df_all = pd.concat(dfs, ignore_index=True)
 
@@ -248,7 +309,6 @@ def _standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
             if c in out.columns:
                 out.rename(columns={c: std}, inplace=True)
                 break
-
     if "epoch" in out.columns:
         out["epoch"] = pd.to_datetime(out["epoch"], errors="coerce")
     else:
