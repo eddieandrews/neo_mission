@@ -10,9 +10,9 @@ from pipeline import (
     criar_run_dir,
     salvar_manifest,
     ler_jpl_csvs,
-    obter_mpc_astroquery,
     enriquecer_taxonomia_rocks,
 )
+from mpc_fix import obter_mpc_astroquery_resiliente
 from campaign import (
     validate_night_params,
     mpc_query_dates_for_nights,
@@ -41,9 +41,6 @@ def init_state():
 
 init_state()
 
-# =========================
-# Sidebar
-# =========================
 st.sidebar.header("Parametros da missao")
 obs = st.sidebar.text_input("Observatorio MPC", "Y28")
 data_inicio = st.sidebar.text_input("Data inicio da campanha (YYYY-MM-DD)", "2026-01-11")
@@ -104,9 +101,6 @@ else:
 
 uploaded = st.sidebar.file_uploader("CSV(s) com objetos", type=["csv"], accept_multiple_files=True)
 
-# =========================
-# Run
-# =========================
 col1, col2 = st.columns([1, 2])
 with col1:
     if st.button("Iniciar nova execucao"):
@@ -126,9 +120,6 @@ if st.session_state.run_dir is None:
 
 run_dir = Path(st.session_state.run_dir)
 
-# =========================
-# Etapa 1
-# =========================
 st.header("Etapa 1 - Ler lista de objetos")
 jpl_paths = []
 if uploaded:
@@ -154,11 +145,9 @@ if st.button("Rodar leitura dos CSVs"):
 if st.session_state.lista_obj is None:
     st.stop()
 
-# =========================
-# Etapa 2
-# =========================
 st.header("Etapa 2 - Buscar efemerides MPC")
 st.caption(f"Consulta cobrindo noites {hora_noite_inicio}-{hora_noite_fim} UTC. Intervalo MPC usado: {cfg_mpc.data_inicio} {cfg_mpc.hora_inicio_utc} ate {cfg_mpc.data_fim} {cfg_mpc.hora_inicio_utc}.")
+st.caption("O app agora tenta automaticamente identificadores alternativos: numero MPC, designacao provisoria e nome completo.")
 
 if st.button("Buscar efemerides"):
     if errors:
@@ -173,7 +162,7 @@ if st.button("Buscar efemerides"):
             bar.progress(max(0, min(100, pct)))
             status.info(f"{pct}% ({i_atual}/{total}) - {obj} - {fase}")
 
-        df_mpc_raw, aud_mpc = obter_mpc_astroquery(st.session_state.lista_obj, cfg_mpc, run_dir, progress_cb=progress_cb)
+        df_mpc_raw, aud_mpc = obter_mpc_astroquery_resiliente(st.session_state.lista_obj, cfg_mpc, run_dir, progress_cb=progress_cb)
         st.session_state.df_mpc_raw = df_mpc_raw
         st.session_state.aud_mpc = aud_mpc
         st.success(f"Consulta finalizada em {round(time.time() - t0, 1)} s. Linhas: {len(df_mpc_raw)}")
@@ -183,9 +172,6 @@ if st.button("Buscar efemerides"):
 if st.session_state.df_mpc_raw is None:
     st.stop()
 
-# =========================
-# Etapa 3
-# =========================
 st.header("Etapa 3 - Avaliar janelas por noite e ranquear bons candidatos")
 
 if st.button("Filtrar por noite e ranquear"):
@@ -217,9 +203,6 @@ if st.button("Filtrar por noite e ranquear"):
 if st.session_state.ranked is None:
     st.stop()
 
-# =========================
-# Etapa 4
-# =========================
 st.header("Etapa 4 - Verificar taxonomia publicada via ROCKS")
 st.caption("Para reduzir trabalho, o ROCKS e consultado apenas nos melhores candidatos observacionais.")
 
@@ -253,9 +236,6 @@ if st.button("Consultar ROCKS nos melhores candidatos"):
 if st.session_state.ranked_tax is None:
     st.stop()
 
-# =========================
-# Etapa 5
-# =========================
 st.header("Etapa 5 - Gerar produtos finais para Eddie e coordenador")
 apenas_sem_tax = st.checkbox("Exportar lista principal apenas com objetos sem taxonomia encontrada", value=True)
 
