@@ -1,451 +1,288 @@
-import streamlit as st
-from pathlib import Path
-import pandas as pd
 import time
+from pathlib import Path
+
+import pandas as pd
+import streamlit as st
 
 from pipeline import (
-    ConfigMissao, validar_cfg, criar_run_dir, salvar_manifest,
-    ler_jpl_csvs, filtrar_epocas, classificar_velocidade,
-    resumir_por_objeto, ranquear, obter_mpc_astroquery,
+    ConfigMissao,
+    validar_cfg,
+    criar_run_dir,
+    salvar_manifest,
+    ler_jpl_csvs,
+    obter_mpc_astroquery,
     enriquecer_taxonomia_rocks,
+)
+from campaign import (
+    validate_night_params,
+    mpc_query_dates_for_nights,
+    filter_observable_nights,
+    summarize_by_night,
+    rank_candidates,
+    make_color_candidates,
+    make_coordinator_support,
 )
 
 st.set_page_config(page_title="Y28 NEO Mission Pipeline", layout="wide")
-st.title("Y28 — Seleção de NEOs para Cores (Pipeline Auditável)")
+st.title("Y28 - candidatos de NEOs para estudo de cores")
+st.caption("Fluxo: observa primeiro as melhores janelas noturnas, depois verifica taxonomia publicada via ROCKS.")
 
 
-# =========================
-# Helpers (estado + manifest)
-# =========================
-def _init_state():
-    if "status" not in st.session_state:
-        st.session_state.status = {
-            "run": None,
-            "etapa1": {"ok": False, "msg": "—", "aud": None},
-            "etapa2": {"ok": False, "msg": "—", "aud": None},
-            "etapa3": {"ok": False, "msg": "—", "aud": None},
-            "etapa4": {"ok": False, "msg": "—", "aud": None},
-        }
-
-    for k in [
-        "run_dir",
-        "df_jpl", "lista_obj", "aud_jpl",
-        "df_mpc_raw", "aud_mpc",
-        "df_obs", "summary", "ranked",
-        "ranked_tax", "aud_tax",
-        "aud_pos_esa",
-    ]:
+def init_state():
+    keys = [
+        "run_dir", "df_jpl", "lista_obj", "aud_jpl", "df_mpc_raw", "aud_mpc",
+        "df_obs", "summary_night", "ranked", "ranked_tax", "candidatos",
+        "apoio_coord", "aud_filt", "aud_night", "aud_rank", "aud_tax", "aud_final",
+    ]
+    for k in keys:
         if k not in st.session_state:
             st.session_state[k] = None
 
 
-def _render_status_cards():
-    st.subheader("Status do pipeline (persistente)")
-    cols = st.columns(4)
-    etapas = [("Etapa 1", "etapa1"), ("Etapa 2", "etapa2"), ("Etapa 3", "etapa3"), ("Etapa 4", "etapa4")]
-    for c, (label, key) in zip(cols, etapas):
-        with c:
-            box = st.container(border=True)
-            ok = bool(st.session_state.status[key]["ok"])
-            msg = st.session_state.status[key]["msg"] or "—"
-            box.markdown(f"**{label}**")
-            if ok:
-                box.success(msg)
-            else:
-                box.info(msg)
-
-
-def _salvar_manifest_atual(run_dir: Path, cfg: ConfigMissao, jpl_paths):
-    aud_etapa3 = (st.session_state.status.get("etapa3", {}) or {}).get("aud", {}) or {}
-    aud_total = {
-        "JPL": st.session_state.get("aud_jpl", {}) or {},
-        "MPC": st.session_state.get("aud_mpc", {}) or {},
-        "Filtros": aud_etapa3.get("Filtros"),
-        "Classe": aud_etapa3.get("Classe"),
-        "Resumo": aud_etapa3.get("Resumo"),
-        "Taxonomia": st.session_state.get("aud_tax", None),
-        "Pos_ESA": st.session_state.get("aud_pos_esa", None),
-    }
-    salvar_manifest(run_dir, cfg, inputs={"jpl_files": [p.name for p in jpl_paths]}, aud=aud_total)
-    return aud_total
-
-
-def _parse_lista_pos_esa(txt: str):
-    if not txt:
-        return []
-    linhas = [x.strip() for x in txt.splitlines()]
-    linhas = [x for x in linhas if x]
-    out = []
-    for s in linhas:
-        s = s.replace("(", "").replace(")", "").strip()
-        s = " ".join(s.split())
-        out.append(s)
-    return out
-
-
-_init_state()
-
+init_state()
 
 # =========================
 # Sidebar
 # =========================
-st.sidebar.header("Parâmetros da Missão")
+st.sidebar.header("Parametros da missao")
+obs = st.sidebar.text_input("Observatorio MPC", "Y28")
+data_inicio = st.sidebar.text_input("Data inicio da campanha (YYYY-MM-DD)", "2026-01-11")
+data_fim = st.sidebar.text_input("Data fim da campanha (YYYY-MM-DD)", "2026-01-25")
+
+st.sidebar.subheader("Janela noturna UTC")
+hora_noite_inicio = st.sidebar.text_input("Inicio da noite UTC", "21:00")
+hora_noite_fim = st.sidebar.text_input("Fim da noite UTC", "08:00")
+duracao_minima = st.sidebar.number_input("Duracao minima da janela (min)", value=60, min_value=10, step=10)
+
+step_min = st.sidebar.selectbox("Passo das efemerides (min)", [5, 10, 15, 20, 30, 60], index=1)
+ALT_MIN = st.sidebar.number_input("ALT_MIN (graus)", value=20.0, step=1.0)
+ALT_MAX = st.sidebar.number_input("ALT_MAX (graus)", value=70.0, step=1.0)
+V_MAX = st.sidebar.number_input("V_MAX", value=19.0, step=0.1)
+SOL_ALT_MAX = st.sidebar.number_input("SOL_ALT_MAX opcional", value=float("nan"), help="Ex.: -18 para noite astronomica. Deixe vazio/NaN para nao filtrar.")
+LIMIAR_RAPIDO = st.sidebar.number_input("Limiar rapido (arcsec/min)", value=10.0, step=0.5)
+max_rocks = st.sidebar.number_input("Maximo de candidatos para consultar no ROCKS", value=50, min_value=1, step=5)
+projeto_nome = st.sidebar.text_input("Nome no campo Projects", "Eddie")
 
 cfg = ConfigMissao(
-    observatorio=st.sidebar.text_input("Observatório", "Y28"),
-    data_inicio=st.sidebar.text_input("Data início (YYYY-MM-DD)", "2026-01-11"),
-    data_fim=st.sidebar.text_input("Data fim (YYYY-MM-DD)", "2026-01-25"),
-    hora_inicio_utc=st.sidebar.text_input("Hora início UTC (HH:MM) (opcional)", "").strip() or None,
-    step_min=st.sidebar.selectbox("Step (min)", [5, 10, 15, 20, 30, 60], index=1),
-    ALT_MIN=st.sidebar.number_input("ALT_MIN (deg)", value=20.0, step=1.0),
-    ALT_MAX=st.sidebar.number_input("ALT_MAX (deg)", value=70.0, step=1.0),
-    V_MAX=st.sidebar.number_input("V_MAX", value=19.0, step=0.1),
-    SOL_ALT_MAX=st.sidebar.number_input(
-        "SOL_ALT_MAX (deg) (opcional, céu escuro)",
-        value=float("nan"),
-        help="Use -18 (astronômico), -12 (náutico), -6 (civil). Deixe vazio para não filtrar.",
-    ),
-    LIMIAR_RAPIDO=st.sidebar.number_input('Limiar rápido μ ("/min)', value=10.0, step=0.5),
-    peso_recencia=st.sidebar.slider("Peso recência", 0.0, 1.0, 0.45, 0.05),
-    peso_mag=st.sidebar.slider("Peso magnitude", 0.0, 1.0, 0.45, 0.05),
-    peso_vel=0.0,
+    observatorio=obs,
+    data_inicio=data_inicio,
+    data_fim=data_fim,
+    hora_inicio_utc=None,
+    step_min=int(step_min),
+    ALT_MIN=float(ALT_MIN),
+    ALT_MAX=float(ALT_MAX),
+    V_MAX=float(V_MAX),
+    SOL_ALT_MAX=None if pd.isna(SOL_ALT_MAX) else float(SOL_ALT_MAX),
+    LIMIAR_RAPIDO=float(LIMIAR_RAPIDO),
 )
 
+cfg_mpc = cfg
 try:
-    if pd.isna(cfg.SOL_ALT_MAX):
-        cfg.SOL_ALT_MAX = None
+    q_ini, q_fim, q_hora = mpc_query_dates_for_nights(data_inicio, data_fim)
+    cfg_mpc = ConfigMissao(
+        observatorio=obs,
+        data_inicio=q_ini,
+        data_fim=q_fim,
+        hora_inicio_utc=q_hora,
+        step_min=int(step_min),
+        ALT_MIN=float(ALT_MIN),
+        ALT_MAX=float(ALT_MAX),
+        V_MAX=float(V_MAX),
+        SOL_ALT_MAX=None if pd.isna(SOL_ALT_MAX) else float(SOL_ALT_MAX),
+        LIMIAR_RAPIDO=float(LIMIAR_RAPIDO),
+    )
 except Exception:
-    cfg.SOL_ALT_MAX = None
+    pass
 
-cfg.peso_vel = max(0.0, 1.0 - (cfg.peso_recencia + cfg.peso_mag))
-st.sidebar.caption(f"Peso velocidade ajustado automaticamente = {cfg.peso_vel:.2f}")
-
-erros = validar_cfg(cfg)
-if erros:
-    st.sidebar.error("Config inválida:")
-    for e in erros:
+errors = validar_cfg(cfg) + validate_night_params(hora_noite_inicio, hora_noite_fim, int(duracao_minima))
+if errors:
+    st.sidebar.error("Configuracao invalida")
+    for e in errors:
         st.sidebar.write(f"- {e}")
 else:
-    st.sidebar.success("Config OK")
+    st.sidebar.success("Configuracao OK")
 
-st.sidebar.divider()
-st.sidebar.header("Arquivos de entrada (JPL)")
-uploaded = st.sidebar.file_uploader("Envie 1 ou mais CSVs do JPL", type=["csv"], accept_multiple_files=True)
-
-st.sidebar.divider()
-st.sidebar.header("Pós-ESA (opcional)")
-post_esa_text = st.sidebar.text_area("Cole a lista pós-ESA (1 por linha)", height=160)
-
+uploaded = st.sidebar.file_uploader("CSV(s) com objetos", type=["csv"], accept_multiple_files=True)
 
 # =========================
-# Status cards
+# Run
 # =========================
-_render_status_cards()
-st.divider()
-
-
-# =========================
-# Run folder
-# =========================
-colA, colB = st.columns([1, 1])
-
-with colA:
-    if st.button("Iniciar nova execução (run)"):
-        if erros:
-            st.error("Corrija a configuração antes de iniciar a execução.")
+col1, col2 = st.columns([1, 2])
+with col1:
+    if st.button("Iniciar nova execucao"):
+        if errors:
+            st.error("Corrija a configuracao antes de iniciar.")
         else:
-            run_dir = criar_run_dir(cfg)
-            st.session_state.run_dir = run_dir
-            st.session_state.status["run"] = str(run_dir)
-
-            # limpa dados
-            for k in [
-                "df_jpl", "lista_obj", "aud_jpl",
-                "df_mpc_raw", "aud_mpc",
-                "df_obs", "summary", "ranked",
-                "ranked_tax", "aud_tax",
-                "aud_pos_esa",
-            ]:
+            st.session_state.run_dir = criar_run_dir(cfg)
+            for k in ["df_jpl", "lista_obj", "aud_jpl", "df_mpc_raw", "aud_mpc", "df_obs", "summary_night", "ranked", "ranked_tax", "candidatos", "apoio_coord", "aud_filt", "aud_night", "aud_tax", "aud_final"]:
                 st.session_state[k] = None
-
-            # reset status
-            st.session_state.status["etapa1"] = {"ok": False, "msg": "Aguardando leitura JPL", "aud": None}
-            st.session_state.status["etapa2"] = {"ok": False, "msg": "Aguardando MPC", "aud": None}
-            st.session_state.status["etapa3"] = {"ok": False, "msg": "Aguardando filtros/ranking", "aud": None}
-            st.session_state.status["etapa4"] = {"ok": False, "msg": "Aguardando Pós-ESA", "aud": None}
-
-            st.success(f"Run criada: {run_dir}")
-
-with colB:
-    st.write("Run atual:", st.session_state.run_dir if st.session_state.run_dir else "—")
-
-st.divider()
+            st.success(f"Run criada: {st.session_state.run_dir}")
+with col2:
+    st.write("Run atual:", st.session_state.run_dir if st.session_state.run_dir else "nenhuma")
 
 if st.session_state.run_dir is None:
-    st.info("Clique em **Iniciar nova execução (run)** para começar.")
+    st.info("Clique em 'Iniciar nova execucao' para comecar.")
     st.stop()
 
-run_dir: Path = st.session_state.run_dir
-
+run_dir = Path(st.session_state.run_dir)
 
 # =========================
-# Etapa 1 — JPL
+# Etapa 1
 # =========================
-st.header("Etapa 1 — Ler e normalizar JPL")
-
+st.header("Etapa 1 - Ler lista de objetos")
 jpl_paths = []
 if uploaded:
     in_dir = run_dir / "inputs"
     in_dir.mkdir(parents=True, exist_ok=True)
     for f in uploaded:
-        path = in_dir / f.name
-        path.write_bytes(f.getbuffer())
-        jpl_paths.append(path)
+        p = in_dir / f.name
+        p.write_bytes(f.getbuffer())
+        jpl_paths.append(p)
 
-if st.button("Rodar leitura JPL"):
+if st.button("Rodar leitura dos CSVs"):
     if not jpl_paths:
-        st.error("Envie pelo menos 1 CSV do JPL.")
+        st.error("Envie pelo menos um CSV.")
     else:
         df_jpl, lista_obj, aud_jpl = ler_jpl_csvs(jpl_paths)
-
         st.session_state.df_jpl = df_jpl
         st.session_state.lista_obj = lista_obj
         st.session_state.aud_jpl = aud_jpl
-
-        st.session_state.status["etapa1"]["ok"] = True
-        st.session_state.status["etapa1"]["msg"] = f"OK — {len(lista_obj)} objetos normalizados"
-        st.session_state.status["etapa1"]["aud"] = aud_jpl
-
-        st.success("JPL lido e normalizado.")
+        st.success(f"{len(lista_obj)} objetos normalizados.")
         st.json(aud_jpl)
-        st.write("Amostra objetos (até 20):")
-        st.code("\n".join(lista_obj[:20]))
-        st.dataframe(df_jpl.head(20), use_container_width=True)
-
-st.divider()
-
-
-# =========================
-# Etapa 2 — MPC
-# =========================
-st.header("Etapa 2 — MPC automático (astroquery) + cache")
+        st.dataframe(df_jpl.head(30), use_container_width=True)
 
 if st.session_state.lista_obj is None:
-    st.info("Rode primeiro a leitura do JPL.")
     st.stop()
 
-lista_obj = st.session_state.lista_obj
-st.caption(f"Objetos para consultar no MPC: {len(lista_obj)}")
+# =========================
+# Etapa 2
+# =========================
+st.header("Etapa 2 - Buscar efemerides MPC")
+st.caption(f"Consulta cobrindo noites {hora_noite_inicio}-{hora_noite_fim} UTC. Intervalo MPC usado: {cfg_mpc.data_inicio} {cfg_mpc.hora_inicio_utc} ate {cfg_mpc.data_fim} {cfg_mpc.hora_inicio_utc}.")
 
-if st.button("Buscar efemérides MPC (astroquery)"):
-    if erros:
-        st.error("Config inválida. Corrija na sidebar antes de buscar MPC.")
+if st.button("Buscar efemerides"):
+    if errors:
+        st.error("Corrija a configuracao antes de consultar o MPC.")
     else:
-        st.session_state.status["etapa2"]["msg"] = "Executando..."
-        st.info("Iniciando consulta ao MPC via astroquery. Mostrando progresso por objeto (cache/baixa/falha).")
-
         bar = st.progress(0)
         status = st.empty()
-        detail = st.empty()
         t0 = time.time()
 
         def progress_cb(i_atual: int, total: int, obj: str, fase: str):
-            total = max(1, int(total))
-            i_atual = int(i_atual)
-            pct = int(round(100 * i_atual / total))
+            pct = int(round(100 * int(i_atual) / max(1, int(total))))
             bar.progress(max(0, min(100, pct)))
-            status.info(f"Progresso: {pct}%  ({i_atual}/{total})")
-            detail.caption(f"Objeto: {obj}  •  Fase: {fase}")
+            status.info(f"{pct}% ({i_atual}/{total}) - {obj} - {fase}")
 
-        df_mpc_raw, aud_mpc = obter_mpc_astroquery(lista_obj, cfg, run_dir, progress_cb=progress_cb)
-
+        df_mpc_raw, aud_mpc = obter_mpc_astroquery(st.session_state.lista_obj, cfg_mpc, run_dir, progress_cb=progress_cb)
         st.session_state.df_mpc_raw = df_mpc_raw
         st.session_state.aud_mpc = aud_mpc
-
-        dt_s = round(time.time() - t0, 2)
-        ok = (len(aud_mpc.get("falhas", [])) == 0) and (not df_mpc_raw.empty)
-
-        st.session_state.status["etapa2"]["ok"] = bool(ok)
-        st.session_state.status["etapa2"]["msg"] = f"Finalizado em {dt_s}s — linhas={len(df_mpc_raw)} | falhas={len(aud_mpc.get('falhas', []))}"
-        st.session_state.status["etapa2"]["aud"] = aud_mpc
-
-        st.success("Consulta MPC finalizada.")
-        st.subheader("Auditoria MPC")
+        st.success(f"Consulta finalizada em {round(time.time() - t0, 1)} s. Linhas: {len(df_mpc_raw)}")
         st.json(aud_mpc)
-
-        if aud_mpc.get("falhas"):
-            st.warning(f"Houve {len(aud_mpc['falhas'])} falhas. Veja abaixo (primeiras 15):")
-            st.dataframe(pd.DataFrame(aud_mpc["falhas"]).head(15), use_container_width=True)
-
-        st.subheader("Prévia do dataframe MPC (primeiras 30 linhas)")
         st.dataframe(df_mpc_raw.head(30), use_container_width=True)
 
-st.divider()
-
-
-# =========================
-# Etapa 3 — Filtros + ranking
-# =========================
-st.header("Etapa 3 — Filtros, resumo e ranking")
-
 if st.session_state.df_mpc_raw is None:
-    st.info("Rode a etapa MPC para criar o dataframe.")
     st.stop()
 
-df_mpc_raw = st.session_state.df_mpc_raw
+# =========================
+# Etapa 3
+# =========================
+st.header("Etapa 3 - Avaliar janelas por noite e ranquear bons candidatos")
 
-if st.button("Filtrar → Classificar → Resumir → Ranqueiar"):
-    df_obs, aud_filt = filtrar_epocas(df_mpc_raw, cfg)
-    df_obs, classe_obj, aud_cls = classificar_velocidade(df_obs, cfg)
-    summary, aud_sum = resumir_por_objeto(df_obs, cfg)
-    ranked = ranquear(summary, cfg) if not summary.empty else summary
+if st.button("Filtrar por noite e ranquear"):
+    df_obs, aud_filt = filter_observable_nights(st.session_state.df_mpc_raw, cfg, hora_noite_inicio, hora_noite_fim)
+    summary_night, aud_night = summarize_by_night(df_obs, cfg, int(duracao_minima))
+    ranked = rank_candidates(summary_night, int(duracao_minima))
 
     st.session_state.df_obs = df_obs
-    st.session_state.summary = summary
+    st.session_state.summary_night = summary_night
     st.session_state.ranked = ranked
-
-    st.session_state.status["etapa3"]["ok"] = not ranked.empty
-    st.session_state.status["etapa3"]["msg"] = f"OK — objetos={len(ranked) if hasattr(ranked, '__len__') else 0}"
-    st.session_state.status["etapa3"]["aud"] = {"Filtros": aud_filt, "Classe": aud_cls, "Resumo": aud_sum}
-
-    aud_total = _salvar_manifest_atual(run_dir, cfg, jpl_paths)
-
-    st.success("Pipeline executado. Manifesto salvo.")
-    st.subheader("Auditoria")
-    st.json(aud_total)
-
-    st.subheader("Tabela ranqueada (prévia)")
-    st.dataframe(ranked.head(50), use_container_width=True)
+    st.session_state.aud_filt = aud_filt
+    st.session_state.aud_night = aud_night
 
     out_dir = run_dir / "outputs"
     out_dir.mkdir(exist_ok=True)
-
+    if not summary_night.empty:
+        summary_night.to_csv(out_dir / "janelas_por_noite_eddie.csv", sep=";", index=False)
     if not ranked.empty:
-        csv_path = out_dir / "neos_tabela_geral.csv"
-        ranked.to_csv(csv_path, sep=";", index=False)
-        st.download_button("Baixar neos_tabela_geral.csv", data=csv_path.read_bytes(), file_name=csv_path.name)
+        ranked.to_csv(out_dir / "ranking_observacional_cores.csv", sep=";", index=False)
 
-st.divider()
+    salvar_manifest(run_dir, cfg, inputs={"jpl_files": [p.name for p in jpl_paths]}, aud={"JPL": st.session_state.aud_jpl, "MPC": st.session_state.aud_mpc, "Filtro_noturno": aud_filt, "Resumo_noite": aud_night})
 
-
-# =========================
-# Taxonomia — ROCKS (opcional)
-# =========================
-st.header("Taxonomia (ROCKS) — opcional")
+    st.success(f"Candidatos observacionais: {len(ranked)}")
+    st.subheader("Resumo por noite")
+    st.dataframe(summary_night.head(100), use_container_width=True)
+    st.subheader("Ranking observacional")
+    st.dataframe(ranked.head(50), use_container_width=True)
 
 if st.session_state.ranked is None:
-    st.info("Rode a Etapa 3 antes de consultar taxonomia.")
-else:
-    ranked = st.session_state.ranked
-
-    st.caption("Consulta via pacote rocks. Se rocks não estiver disponível, a auditoria vai indicar.")
-    if st.button("Enriquecer ranking com taxonomia (ROCKS)"):
-        tax_status = st.empty()
-
-        def tax_progress_cb(i_atual: int, total: int, obj: str, fase: str):
-            tax_status.info(f"Taxonomia {i_atual}/{total}: {obj} ({fase})")
-
-        ranked_tax, aud_tax = enriquecer_taxonomia_rocks(ranked, progress_cb=tax_progress_cb)
-        st.session_state.ranked_tax = ranked_tax
-        st.session_state.aud_tax = aud_tax
-
-        aud_total = _salvar_manifest_atual(run_dir, cfg, jpl_paths)
-
-        st.success("Enriquecimento de taxonomia concluído.")
-        st.subheader("Auditoria Taxonomia")
-        st.json(aud_tax)
-
-        with st.expander("Manifest atualizado (auditoria consolidada)", expanded=False):
-            st.json(aud_total)
-
-        if not ranked_tax.empty:
-            st.subheader("Tabela com taxonomia (prévia)")
-            st.dataframe(ranked_tax.head(50), use_container_width=True)
-
-            out_dir = run_dir / "outputs"
-            out_dir.mkdir(exist_ok=True)
-            csv_tax = out_dir / "neos_tabela_geral_taxonomia.csv"
-            ranked_tax.to_csv(csv_tax, sep=";", index=False)
-
-            st.download_button(
-                "Baixar neos_tabela_geral_taxonomia.csv",
-                data=csv_tax.read_bytes(),
-                file_name=csv_tax.name,
-            )
-
-st.divider()
-
+    st.stop()
 
 # =========================
-# Etapa 4 — Pós-ESA
+# Etapa 4
 # =========================
-st.header("Etapa 4 — Pós-ESA (opcional)")
-st.caption("Cole a lista pós-ESA na sidebar. Se tiver taxonomia, usamos a tabela enriquecida automaticamente.")
+st.header("Etapa 4 - Verificar taxonomia publicada via ROCKS")
+st.caption("Para reduzir trabalho, o ROCKS e consultado apenas nos melhores candidatos observacionais.")
 
-if st.session_state.ranked is None:
-    st.info("Rode a Etapa 3 antes de usar Pós-ESA.")
-else:
-    ranked_base = st.session_state.ranked
-    if st.session_state.ranked_tax is not None:
-        ranked_base = st.session_state.ranked_tax
+if st.button("Consultar ROCKS nos melhores candidatos"):
+    base = st.session_state.ranked.head(int(max_rocks)).copy()
+    tax_status = st.empty()
 
-    pos_list = _parse_lista_pos_esa(post_esa_text)
+    def tax_progress_cb(i_atual: int, total: int, obj: str, fase: str):
+        tax_status.info(f"ROCKS {i_atual}/{total}: {obj}")
 
-    if not pos_list:
-        st.info("Sem lista pós-ESA colada (ok).")
-        st.session_state.status["etapa4"]["ok"] = False
-        st.session_state.status["etapa4"]["msg"] = "Sem lista Pós-ESA"
-    else:
-        st.success(f"Lista Pós-ESA detectada: {len(pos_list)} objetos.")
+    ranked_tax, aud_tax = enriquecer_taxonomia_rocks(base, progress_cb=tax_progress_cb)
+    if "Taxonomia disponível" in ranked_tax.columns:
+        ranked_tax["Taxonomia_encontrada"] = ranked_tax["Taxonomia disponível"]
+    if "Classe taxonômica" in ranked_tax.columns:
+        ranked_tax["Classe_taxonomica"] = ranked_tax["Classe taxonômica"]
+    if "Fonte taxonomia" in ranked_tax.columns:
+        ranked_tax["Fonte_taxonomia"] = ranked_tax["Fonte taxonomia"]
 
-        df = ranked_base.copy()
+    st.session_state.ranked_tax = ranked_tax
+    st.session_state.aud_tax = aud_tax
 
-        # compatível com versões que tenham "Nome do objeto" ou só "Nome_limpo"
-        if "Nome do objeto" in df.columns:
-            df["Nome_do_objeto_sem_asterisco"] = df["Nome do objeto"].astype(str).str.replace("*", "", regex=False).str.strip()
-        else:
-            df["Nome_do_objeto_sem_asterisco"] = df["Nome_limpo"].astype(str).str.strip()
+    out_dir = run_dir / "outputs"
+    out_dir.mkdir(exist_ok=True)
+    if not ranked_tax.empty:
+        ranked_tax.to_csv(out_dir / "ranking_com_taxonomia_rocks.csv", sep=";", index=False)
 
-        df["Nome_limpo_norm"] = df["Nome_limpo"].astype(str).str.strip()
+    st.success("Consulta ROCKS concluida.")
+    st.json(aud_tax)
+    st.dataframe(ranked_tax.head(50), use_container_width=True)
 
-        mask = df["Nome_limpo_norm"].isin(pos_list) | df["Nome_do_objeto_sem_asterisco"].isin(pos_list)
-        final_pos = df[mask].copy().reset_index(drop=True)
+if st.session_state.ranked_tax is None:
+    st.stop()
 
-        encontrados = set(final_pos["Nome_limpo_norm"].tolist()) | set(final_pos["Nome_do_objeto_sem_asterisco"].tolist())
-        nao_encontrados = [x for x in pos_list if x not in encontrados]
+# =========================
+# Etapa 5
+# =========================
+st.header("Etapa 5 - Gerar produtos finais para Eddie e coordenador")
+apenas_sem_tax = st.checkbox("Exportar lista principal apenas com objetos sem taxonomia encontrada", value=True)
 
-        aud_pos = {
-            "pos_esa_itens": len(pos_list),
-            "pos_esa_encontrados": int(len(final_pos)),
-            "pos_esa_nao_encontrados": nao_encontrados[:80],
-        }
-        st.session_state.aud_pos_esa = aud_pos
+if st.button("Gerar produtos finais"):
+    candidatos, aud_final = make_color_candidates(st.session_state.ranked_tax, only_without_taxonomy=apenas_sem_tax)
+    apoio = make_coordinator_support(candidatos, project=projeto_nome)
 
-        st.session_state.status["etapa4"]["ok"] = not final_pos.empty
-        st.session_state.status["etapa4"]["msg"] = f"Encontrados {len(final_pos)}/{len(pos_list)}"
-        st.session_state.status["etapa4"]["aud"] = aud_pos
+    st.session_state.candidatos = candidatos
+    st.session_state.apoio_coord = apoio
+    st.session_state.aud_final = aud_final
 
-        _salvar_manifest_atual(run_dir, cfg, jpl_paths)
+    out_dir = run_dir / "outputs"
+    out_dir.mkdir(exist_ok=True)
+    candidatos_path = out_dir / "candidatos_cores_eddie.csv"
+    apoio_path = out_dir / "apoio_coordenador_eddie.csv"
+    candidatos.to_csv(candidatos_path, sep=";", index=False)
+    apoio.to_csv(apoio_path, sep=";", index=False)
 
-        st.subheader("Auditoria Pós-ESA")
-        st.json(aud_pos)
+    salvar_manifest(run_dir, cfg, inputs={"jpl_files": [p.name for p in jpl_paths]}, aud={"JPL": st.session_state.aud_jpl, "MPC": st.session_state.aud_mpc, "Filtro_noturno": st.session_state.aud_filt, "Resumo_noite": st.session_state.aud_night, "Taxonomia": st.session_state.aud_tax, "Final": aud_final})
 
-        if final_pos.empty:
-            st.warning("Nenhum item da lista Pós-ESA foi encontrado na tabela base.")
-        else:
-            # limpa colunas auxiliares
-            final_show = final_pos.drop(columns=["Nome_do_objeto_sem_asterisco", "Nome_limpo_norm"], errors="ignore")
+    st.success(f"Produtos gerados. Candidatos finais: {len(candidatos)}")
+    st.json(aud_final)
 
-            st.subheader("Tabela final Pós-ESA (ranqueada)")
-            st.dataframe(final_show, use_container_width=True)
+    st.subheader("candidatos_cores_eddie.csv")
+    st.dataframe(candidatos, use_container_width=True)
+    st.download_button("Baixar candidatos_cores_eddie.csv", data=candidatos_path.read_bytes(), file_name="candidatos_cores_eddie.csv")
 
-            out_dir = run_dir / "outputs"
-            out_dir.mkdir(exist_ok=True)
-            csv_path = out_dir / "neos_tabela_pos_esa.csv"
-            final_show.to_csv(csv_path, sep=";", index=False)
-
-            st.download_button(
-                "Baixar neos_tabela_pos_esa.csv",
-                data=csv_path.read_bytes(),
-                file_name=csv_path.name
-            )
+    st.subheader("apoio_coordenador_eddie.csv")
+    st.dataframe(apoio, use_container_width=True)
+    st.download_button("Baixar apoio_coordenador_eddie.csv", data=apoio_path.read_bytes(), file_name="apoio_coordenador_eddie.csv")
