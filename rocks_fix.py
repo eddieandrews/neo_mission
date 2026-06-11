@@ -10,181 +10,156 @@ from object_ids import identifier_variants, parse_object_identifier
 ProgressCB = Optional[Callable[[int, int, str, str], None]]
 
 
-def _pick_first_nonempty(data: Dict[str, Any], keys: List[str]) -> Optional[str]:
-    for key in keys:
-        value = data.get(key)
-        if value is not None and str(value).strip() != "":
-            return str(value).strip()
-    return None
-
-
-def _extract_taxonomy(payload: Any) -> Tuple[bool, Optional[str], Optional[str], Any]:
-    if payload is None:
-        return False, None, None, None
-    if isinstance(payload, list):
-        if len(payload) == 0:
-            return False, None, None, []
-        payload0 = payload[0]
-        if isinstance(payload0, dict):
-            cls = _pick_first_nonempty(payload0, ["class", "name", "value", "label", "type", "taxonomy"])
-            src = _pick_first_nonempty(payload0, ["source", "reference", "ref", "bibcode", "shortbib"])
-            return cls is not None, cls, src, payload
-        text = str(payload0).strip()
-        return bool(text), text or None, None, payload
-    if isinstance(payload, dict):
-        cls = _pick_first_nonempty(payload, ["class", "name", "value", "label", "type", "taxonomy"])
-        src = _pick_first_nonempty(payload, ["source", "reference", "ref", "bibcode", "shortbib"])
-        return cls is not None, cls, src, payload
-    text = str(payload).strip()
-    return bool(text), text or None, None, text
-
-
-def _safe_attr(obj: Any, names: List[str]) -> Any:
-    for name in names:
+def _val(x: Any) -> Any:
+    if x is None:
+        return None
+    if hasattr(x, "value"):
         try:
-            value = getattr(obj, name)
-            if value is not None and str(value).strip() != "":
-                return value
+            return _val(x.value)
         except Exception:
             pass
+    if isinstance(x, pd.Series):
+        y = x.dropna().tolist()
+        return _val(y[0]) if y else None
+    if isinstance(x, (list, tuple)):
+        return _val(x[0]) if x else None
+    return x
+
+
+def _attr(obj: Any, path: List[str]) -> Any:
+    cur = obj
+    for name in path:
+        try:
+            cur = getattr(cur, name)
+        except Exception:
+            return None
+    out = _val(cur)
+    if out is None or str(out).strip() == "":
+        return None
+    return out
+
+
+def _first(obj: Any, paths: List[List[str]]) -> Any:
+    for path in paths:
+        out = _attr(obj, path)
+        if out is not None:
+            return out
     return None
 
 
-def _clean(value: Any) -> Any:
-    if value is None:
+def _table(table: Any, cols: List[str]) -> Any:
+    try:
+        df = pd.DataFrame(table)
+    except Exception:
         return None
-    if isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, dict):
-        for key in ["value", "val", "mean", "preferred", "diameter", "albedo", "H", "period"]:
-            if key in value:
-                return _clean(value[key])
-        return str(value)
-    if isinstance(value, list):
-        return _clean(value[0]) if value else None
-    return str(value)
+    if df.empty:
+        return None
+    for col in cols:
+        if col in df.columns:
+            vals = df[col].dropna().tolist()
+            if vals:
+                return vals[0]
+    return None
 
 
-def _query_one(rocks_mod: Any, target: str) -> Dict[str, Any]:
-    rock_obj = rocks_mod.Rock(target)
-    tax_payload = getattr(rock_obj, "taxonomy", None)
-    has_tax, tax_class, tax_source, tax_raw = _extract_taxonomy(tax_payload)
-    return {
-        "status": "ok",
-        "has_taxonomy": has_tax,
-        "taxonomy_class": tax_class,
-        "taxonomy_source": tax_source,
-        "taxonomy_raw": tax_raw,
-        "D_km": _clean(_safe_attr(rock_obj, ["diameter", "diameter_km", "D"])),
-        "Albedo": _clean(_safe_attr(rock_obj, ["albedo", "geometric_albedo", "pv"])),
-        "H": _clean(_safe_attr(rock_obj, ["H", "absolute_magnitude", "absolute_magnitude_H"])),
-        "Prot_h": _clean(_safe_attr(rock_obj, ["rotation_period", "rotational_period", "period", "period_rotation"])),
-        "Porb_yr": _clean(_safe_attr(rock_obj, ["orbital_period", "period_orbit"])),
-        "error": None,
-    }
+def _import_rocks() -> Tuple[Any, Optional[str]]:
+    try:
+        rocks_mod = importlib.import_module("rocks")
+    except Exception as exc:
+        return None, f"Nao importou rocks/space-rocks: {exc}"
+    if not hasattr(rocks_mod, "Rock") or not hasattr(rocks_mod, "id"):
+        return None, "O modulo rocks importado nao possui Rock/id; instale space-rocks."
+    return rocks_mod, None
+
+
+def _resolve(rocks_mod: Any, variants: List[str]) -> Tuple[Any, Optional[str], Optional[str]]:
+    for target in variants:
+        try:
+            name, number = rocks_mod.id(target)
+            if number is not None and str(number).lower() not in ["nan", "none", ""]:
+                return number, str(name), target
+            if name is not None and str(name).strip():
+                return target, str(name), target
+        except Exception:
+            pass
+    return None, None, None
 
 
 def query_rocks_resilient(object_name: str) -> Dict[str, Any]:
     info = parse_object_identifier(object_name)
     variants = identifier_variants(object_name, include_name=True)
-
-    try:
-        rocks_mod = importlib.import_module("rocks")
-    except Exception:
-        return {
-            "status": "rocks_unavailable",
-            "has_taxonomy": False,
-            "taxonomy_class": None,
-            "taxonomy_source": None,
-            "taxonomy_raw": None,
-            "rocks_target_usado": None,
-            "identificador_preferido": info.get("identificador_preferido"),
-            "numero_oficial": info.get("numero_oficial"),
-            "designacao_provisoria": info.get("designacao_provisoria"),
-            "tentativas": variants,
-            "error": "Pacote 'rocks' não está disponível no ambiente.",
-        }
-
-    last_err = None
-    for target in variants:
-        try:
-            result = _query_one(rocks_mod, target)
-            result.update(
-                {
-                    "rocks_target_usado": target,
-                    "identificador_preferido": info.get("identificador_preferido"),
-                    "numero_oficial": info.get("numero_oficial"),
-                    "designacao_provisoria": info.get("designacao_provisoria"),
-                    "tentativas": variants,
-                }
-            )
-            return result
-        except Exception as e:
-            last_err = e
-
-    return {
-        "status": "query_error",
-        "has_taxonomy": False,
-        "taxonomy_class": None,
-        "taxonomy_source": None,
-        "taxonomy_raw": None,
-        "rocks_target_usado": None,
+    base = {
         "identificador_preferido": info.get("identificador_preferido"),
+        "tipo_identificador_preferido": info.get("tipo_identificador_preferido"),
         "numero_oficial": info.get("numero_oficial"),
         "designacao_provisoria": info.get("designacao_provisoria"),
         "tentativas": variants,
-        "error": str(last_err) if last_err else "Falha desconhecida",
     }
+    rocks_mod, err = _import_rocks()
+    if err:
+        return {**base, "status": "space_rocks_unavailable", "has_taxonomy": False, "error": err}
+
+    resolved_id, resolved_name, resolved_from = _resolve(rocks_mod, variants)
+    target = resolved_id or info.get("identificador_preferido") or variants[0]
+    try:
+        rock = rocks_mod.Rock(target, datacloud="taxonomies")
+        tax_table = getattr(rock, "taxonomies", None)
+        tax_class = _first(rock, [["taxonomy", "class_"], ["parameters", "physical", "taxonomy", "class_"]]) or _table(tax_table, ["class_", "class", "taxonomy"])
+        tax_rows = len(pd.DataFrame(tax_table)) if tax_table is not None else 0
+        return {
+            **base,
+            "status": "ok",
+            "has_taxonomy": tax_class is not None and str(tax_class).strip() != "",
+            "taxonomy_class": tax_class,
+            "taxonomy_complex": _first(rock, [["taxonomy", "complex"]]) or _table(tax_table, ["complex"]),
+            "taxonomy_scheme": _first(rock, [["taxonomy", "scheme"]]) or _table(tax_table, ["scheme"]),
+            "taxonomy_method": _table(tax_table, ["method"]),
+            "taxonomy_waverange": _table(tax_table, ["waverange", "wavelength"]),
+            "taxonomy_source": _first(rock, [["taxonomy", "shortbib"], ["taxonomy", "bibcode"]]) or _table(tax_table, ["shortbib", "bibcode", "reference"]),
+            "taxonomy_datacloud_rows": int(tax_rows),
+            "rocks_target_usado": target,
+            "rocks_resolved_name": resolved_name,
+            "rocks_resolved_number": resolved_id,
+            "rocks_resolved_from": resolved_from,
+            "D_km": _first(rock, [["diameter"], ["parameters", "physical", "diameter"]]),
+            "Albedo": _first(rock, [["albedo"], ["parameters", "physical", "albedo"]]),
+            "H": _first(rock, [["absolute_magnitude"], ["H"]]),
+            "Prot_h": _first(rock, [["rotation_period"], ["rotational_period"], ["period"]]),
+            "Porb_yr": _first(rock, [["orbital_period"], ["P"]]),
+            "error": None,
+        }
+    except Exception as exc:
+        return {**base, "status": "query_error", "has_taxonomy": False, "rocks_target_usado": target, "rocks_resolved_name": resolved_name, "rocks_resolved_number": resolved_id, "rocks_resolved_from": resolved_from, "error": str(exc)}
 
 
-def enriquecer_taxonomia_rocks_resiliente(
-    ranked: pd.DataFrame,
-    progress_cb: ProgressCB = None,
-) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    aud: Dict[str, Any] = {
-        "objetos_entrada": 0,
-        "objetos_consultados": 0,
-        "objetos_com_taxonomia": 0,
-        "objetos_sem_taxonomia": 0,
-        "falhas": [],
-        "rocks_disponivel": None,
-    }
-
+def enriquecer_taxonomia_rocks_resiliente(ranked: pd.DataFrame, progress_cb: ProgressCB = None) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    aud: Dict[str, Any] = {"objetos_entrada": 0, "objetos_consultados": 0, "objetos_com_taxonomia": 0, "objetos_sem_taxonomia": 0, "falhas": [], "rocks_disponivel": None, "metodo": "space-rocks Rock(datacloud=taxonomies)"}
     if ranked is None or ranked.empty:
         return pd.DataFrame(), aud
     if "Nome_limpo" not in ranked.columns:
-        raise KeyError("Tabela ranqueada sem coluna 'Nome_limpo'.")
-
+        raise KeyError("Tabela ranqueada sem coluna Nome_limpo.")
     df = ranked.copy()
     objs = df["Nome_limpo"].astype(str).str.strip().dropna().unique().tolist()
     aud["objetos_entrada"] = int(len(objs))
-
     cache: Dict[str, Dict[str, Any]] = {}
-    total = max(1, len(objs))
     for i, obj in enumerate(objs, start=1):
-        info = parse_object_identifier(obj)
         if progress_cb:
-            progress_cb(i, total, str(info.get("identificador_preferido") or obj), "taxonomia")
+            progress_cb(i, len(objs), obj, "space-rocks")
         res = query_rocks_resilient(obj)
         cache[obj] = res
         aud["objetos_consultados"] += 1
         if res.get("status") != "ok":
-            aud["falhas"].append({"object": obj, "identificador_preferido": res.get("identificador_preferido"), "tentativas": res.get("tentativas"), "erro": res.get("error"), "status": res.get("status")})
-
-    df["Identificador_preferido"] = df["Nome_limpo"].map(lambda x: cache.get(str(x).strip(), {}).get("identificador_preferido"))
-    df["Numero_oficial"] = df["Nome_limpo"].map(lambda x: cache.get(str(x).strip(), {}).get("numero_oficial"))
-    df["Designacao_provisoria"] = df["Nome_limpo"].map(lambda x: cache.get(str(x).strip(), {}).get("designacao_provisoria"))
-    df["ROCKS_target_usado"] = df["Nome_limpo"].map(lambda x: cache.get(str(x).strip(), {}).get("rocks_target_usado"))
-    df["Taxonomia disponível"] = df["Nome_limpo"].map(lambda x: bool(cache.get(str(x).strip(), {}).get("has_taxonomy", False)))
-    df["Classe taxonômica"] = df["Nome_limpo"].map(lambda x: cache.get(str(x).strip(), {}).get("taxonomy_class"))
-    df["Fonte taxonomia"] = df["Nome_limpo"].map(lambda x: cache.get(str(x).strip(), {}).get("taxonomy_source"))
-    df["Taxonomia_status_consulta"] = df["Nome_limpo"].map(lambda x: cache.get(str(x).strip(), {}).get("status"))
-    df["Taxonomia_erro"] = df["Nome_limpo"].map(lambda x: cache.get(str(x).strip(), {}).get("error"))
-
-    for col in ["D_km", "Albedo", "H", "Prot_h", "Porb_yr"]:
-        df[col] = df["Nome_limpo"].map(lambda x, c=col: cache.get(str(x).strip(), {}).get(c))
-
+            aud["falhas"].append({"object": obj, "status": res.get("status"), "erro": res.get("error"), "tentativas": res.get("tentativas")})
+    mapping = {
+        "Identificador_preferido": "identificador_preferido", "Tipo_identificador_preferido": "tipo_identificador_preferido", "Numero_oficial": "numero_oficial", "Designacao_provisoria": "designacao_provisoria",
+        "ROCKS_target_usado": "rocks_target_usado", "ROCKS_resolved_name": "rocks_resolved_name", "ROCKS_resolved_number": "rocks_resolved_number", "ROCKS_resolved_from": "rocks_resolved_from",
+        "Taxonomia disponível": "has_taxonomy", "Classe taxonômica": "taxonomy_class", "Complexo taxonômico": "taxonomy_complex", "Esquema taxonômico": "taxonomy_scheme", "Metodo taxonomia": "taxonomy_method", "Faixa taxonomia": "taxonomy_waverange", "Fonte taxonomia": "taxonomy_source", "Taxonomia_datacloud_rows": "taxonomy_datacloud_rows", "Taxonomia_status_consulta": "status", "Taxonomia_erro": "error",
+        "D_km": "D_km", "Albedo": "Albedo", "H": "H", "Prot_h": "Prot_h", "Porb_yr": "Porb_yr",
+    }
+    for out_col, key in mapping.items():
+        df[out_col] = df["Nome_limpo"].map(lambda x, k=key: cache.get(str(x).strip(), {}).get(k))
+    df["Taxonomia disponível"] = df["Taxonomia disponível"].fillna(False).astype(bool)
     aud["objetos_com_taxonomia"] = int(df[df["Taxonomia disponível"]]["Nome_limpo"].nunique())
     aud["objetos_sem_taxonomia"] = int(df[~df["Taxonomia disponível"]]["Nome_limpo"].nunique())
-    aud["rocks_disponivel"] = len([f for f in aud["falhas"] if f.get("status") == "rocks_unavailable"]) == 0
+    aud["rocks_disponivel"] = len([f for f in aud["falhas"] if f.get("status") == "space_rocks_unavailable"]) == 0
     return df, aud
