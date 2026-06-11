@@ -50,10 +50,6 @@ def build_night_windows(data_inicio: str, data_fim: str, start_utc: str = "21:00
 
 
 def mpc_query_dates_for_nights(data_inicio: str, data_fim: str) -> Tuple[str, str, str]:
-    """Retorna datas/hora para consultar MPC cobrindo noites 21-08.
-
-    Usa 12:00 UTC como referência para incluir a noite inicial e a manhã após a última noite.
-    """
     end = _as_date(data_fim) + timedelta(days=1)
     return data_inicio, end.isoformat(), "12:00"
 
@@ -228,7 +224,7 @@ def rank_candidates(summary_night: pd.DataFrame, min_duration_min: int) -> pd.Da
 
 
 def make_color_candidates(ranked_tax: pd.DataFrame, only_without_taxonomy: bool = True) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    audit = {"entrada": int(len(ranked_tax)) if ranked_tax is not None else 0, "saida": 0, "com_taxonomia": 0, "sem_taxonomia": 0}
+    audit = {"entrada": int(len(ranked_tax)) if ranked_tax is not None else 0, "saida": 0, "com_taxonomia": 0, "sem_taxonomia_confirmada": 0, "consulta_indisponivel": 0}
     if ranked_tax is None or ranked_tax.empty:
         return pd.DataFrame(), audit
     df = ranked_tax.copy()
@@ -238,14 +234,31 @@ def make_color_candidates(ranked_tax: pd.DataFrame, only_without_taxonomy: bool 
         df["Classe_taxonomica"] = df["Classe taxonômica"]
     if "Fonte taxonomia" in df.columns and "Fonte_taxonomia" not in df.columns:
         df["Fonte_taxonomia"] = df["Fonte taxonomia"]
+
     tax = df.get("Taxonomia_encontrada", pd.Series(False, index=df.index)).fillna(False).astype(bool)
-    df["Status_cores"] = np.where(tax, "Baixa prioridade: já tem taxonomia", "Candidato")
-    df["Motivo_status"] = np.where(tax, "ROCKS retornou taxonomia publicada.", "Sem taxonomia publicada encontrada; bom candidato para cores.")
-    df["Recomendacao"] = np.where(tax, "Remover da lista principal", "Priorizar")
+    status = df.get("Taxonomia_status_consulta", pd.Series("nao_consultado", index=df.index)).fillna("nao_consultado").astype(str)
+    consulta_ok = status.eq("ok")
+    consulta_indisponivel = ~consulta_ok
+    sem_taxonomia_confirmada = (~tax) & consulta_ok
+
+    df["Status_cores"] = "Verificar manualmente: consulta de taxonomia indisponível"
+    df["Motivo_status"] = "A consulta ROCKS/space-rocks falhou ou ficou inconclusiva; não é seguro afirmar que o objeto não tem taxonomia."
+    df["Recomendacao"] = "Verificar conexão/DNS ou consultar manualmente no SsODNet/ROCKS"
+
+    df.loc[sem_taxonomia_confirmada, "Status_cores"] = "Candidato"
+    df.loc[sem_taxonomia_confirmada, "Motivo_status"] = "Consulta ROCKS/space-rocks concluída e sem taxonomia publicada encontrada."
+    df.loc[sem_taxonomia_confirmada, "Recomendacao"] = "Priorizar"
+
+    df.loc[tax, "Status_cores"] = "Baixa prioridade: já tem taxonomia"
+    df.loc[tax, "Motivo_status"] = "ROCKS/space-rocks retornou taxonomia publicada."
+    df.loc[tax, "Recomendacao"] = "Remover da lista principal"
+
     audit["com_taxonomia"] = int(tax.sum())
-    audit["sem_taxonomia"] = int((~tax).sum())
+    audit["sem_taxonomia_confirmada"] = int(sem_taxonomia_confirmada.sum())
+    audit["consulta_indisponivel"] = int(consulta_indisponivel.sum())
+
     if only_without_taxonomy:
-        df = df[~tax].copy()
+        df = df[sem_taxonomia_confirmada].copy()
     audit["saida"] = int(len(df))
     return df.sort_values("Prioridade").reset_index(drop=True), audit
 
