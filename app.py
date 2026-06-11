@@ -22,10 +22,11 @@ from campaign import (
     make_color_candidates,
     make_coordinator_support,
 )
+from diagnostics import cache_stats, clear_cache, rocks_diagnostic, identifiers_audit_df
 
 st.set_page_config(page_title="Y28 NEO Mission Pipeline", layout="wide")
 st.title("Y28 - candidatos de NEOs para estudo de cores")
-st.caption("Fluxo: observa primeiro as melhores janelas noturnas, depois verifica taxonomia publicada via ROCKS.")
+st.caption("Fluxo: melhores janelas noturnas primeiro; depois ROCKS para verificar taxonomia publicada.")
 
 
 def init_state():
@@ -41,6 +42,9 @@ def init_state():
 
 init_state()
 
+# =========================
+# Sidebar
+# =========================
 st.sidebar.header("Parametros da missao")
 obs = st.sidebar.text_input("Observatorio MPC", "Y28")
 data_inicio = st.sidebar.text_input("Data inicio da campanha (YYYY-MM-DD)", "2026-01-11")
@@ -101,6 +105,39 @@ else:
 
 uploaded = st.sidebar.file_uploader("CSV(s) com objetos", type=["csv"], accept_multiple_files=True)
 
+# =========================
+# Ferramentas rápidas
+# =========================
+st.subheader("Ferramentas de controle")
+ctrl1, ctrl2, ctrl3 = st.columns([1, 1, 2])
+with ctrl1:
+    st.metric("Arquivos no cache", cache_stats().get("parquet_files", 0))
+with ctrl2:
+    st.metric("Cache (MB)", cache_stats().get("total_mb", 0))
+with ctrl3:
+    if st.button("Apagar cache MPC local"):
+        res = clear_cache()
+        st.warning("Cache apagado. A proxima consulta MPC sera refeita do zero.")
+        st.json(res)
+
+with st.expander("Diagnostico do reconhecimento de objetos e ROCKS", expanded=False):
+    exemplos_default = "1566 Icarus 1949 MA\n1036 Ganymed A924 UB\n398188 Agni 2010 LE15\n2021 VR3\n(23714) 1998 EC3"
+    diag_text = st.text_area("Objetos para testar", value=exemplos_default, height=120)
+    diag_objs = [x.strip() for x in diag_text.splitlines() if x.strip()]
+    if diag_objs:
+        st.write("Reconhecimento de identificadores:")
+        st.dataframe(identifiers_audit_df(diag_objs), use_container_width=True)
+    if st.button("Testar se ROCKS esta funcionando"):
+        diag = rocks_diagnostic(diag_objs)
+        if not diag.get("installed"):
+            st.error("ROCKS nao foi importado no ambiente atual.")
+        else:
+            st.success(f"ROCKS importado. Versao: {diag.get('version')}")
+        st.json(diag)
+
+# =========================
+# Run
+# =========================
 col1, col2 = st.columns([1, 2])
 with col1:
     if st.button("Iniciar nova execucao"):
@@ -120,6 +157,9 @@ if st.session_state.run_dir is None:
 
 run_dir = Path(st.session_state.run_dir)
 
+# =========================
+# Etapa 1
+# =========================
 st.header("Etapa 1 - Ler lista de objetos")
 jpl_paths = []
 if uploaded:
@@ -140,14 +180,19 @@ if st.button("Rodar leitura dos CSVs"):
         st.session_state.aud_jpl = aud_jpl
         st.success(f"{len(lista_obj)} objetos normalizados.")
         st.json(aud_jpl)
+        st.write("Auditoria dos identificadores reconhecidos:")
+        st.dataframe(identifiers_audit_df(lista_obj).head(100), use_container_width=True)
         st.dataframe(df_jpl.head(30), use_container_width=True)
 
 if st.session_state.lista_obj is None:
     st.stop()
 
+# =========================
+# Etapa 2
+# =========================
 st.header("Etapa 2 - Buscar efemerides MPC")
 st.caption(f"Consulta cobrindo noites {hora_noite_inicio}-{hora_noite_fim} UTC. Intervalo MPC usado: {cfg_mpc.data_inicio} {cfg_mpc.hora_inicio_utc} ate {cfg_mpc.data_fim} {cfg_mpc.hora_inicio_utc}.")
-st.caption("O app tenta automaticamente identificadores em ordem: numero oficial, designacao provisoria e nome original.")
+st.caption("Ordem de tentativa: numero oficial -> designacao provisoria -> designacao packed -> nome original.")
 
 if st.button("Buscar efemerides"):
     if errors:
@@ -167,11 +212,20 @@ if st.button("Buscar efemerides"):
         st.session_state.aud_mpc = aud_mpc
         st.success(f"Consulta finalizada em {round(time.time() - t0, 1)} s. Linhas: {len(df_mpc_raw)}")
         st.json(aud_mpc)
+        if aud_mpc.get("identificadores_usados"):
+            st.write("Identificadores realmente usados no MPC:")
+            st.dataframe(pd.DataFrame(aud_mpc["identificadores_usados"]).head(100), use_container_width=True)
+        if aud_mpc.get("falhas"):
+            st.warning(f"Falhas MPC: {len(aud_mpc['falhas'])}. Veja as primeiras abaixo.")
+            st.dataframe(pd.DataFrame(aud_mpc["falhas"]).head(100), use_container_width=True)
         st.dataframe(df_mpc_raw.head(30), use_container_width=True)
 
 if st.session_state.df_mpc_raw is None:
     st.stop()
 
+# =========================
+# Etapa 3
+# =========================
 st.header("Etapa 3 - Avaliar janelas por noite e ranquear bons candidatos")
 
 if st.button("Filtrar por noite e ranquear"):
@@ -203,8 +257,11 @@ if st.button("Filtrar por noite e ranquear"):
 if st.session_state.ranked is None:
     st.stop()
 
+# =========================
+# Etapa 4
+# =========================
 st.header("Etapa 4 - Verificar taxonomia publicada via ROCKS")
-st.caption("Para reduzir trabalho, o ROCKS e consultado apenas nos melhores candidatos observacionais, usando o identificador preferido.")
+st.caption("ROCKS agora usa o mesmo identificador preferido: numero oficial primeiro; designacao provisoria depois.")
 
 if st.button("Consultar ROCKS nos melhores candidatos"):
     base = st.session_state.ranked.head(int(max_rocks)).copy()
@@ -231,11 +288,17 @@ if st.button("Consultar ROCKS nos melhores candidatos"):
 
     st.success("Consulta ROCKS concluida.")
     st.json(aud_tax)
+    if aud_tax.get("falhas"):
+        st.warning("Algumas consultas ROCKS falharam ou foram inconclusivas.")
+        st.dataframe(pd.DataFrame(aud_tax["falhas"]).head(100), use_container_width=True)
     st.dataframe(ranked_tax.head(50), use_container_width=True)
 
 if st.session_state.ranked_tax is None:
     st.stop()
 
+# =========================
+# Etapa 5
+# =========================
 st.header("Etapa 5 - Gerar produtos finais para Eddie e coordenador")
 apenas_sem_tax = st.checkbox("Exportar lista principal apenas com objetos sem taxonomia encontrada", value=True)
 
