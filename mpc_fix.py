@@ -9,66 +9,36 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import pandas as pd
 from astropy import units as u
 
+from object_ids import identifier_variants, parse_object_identifier
 from pipeline import ConfigMissao, _compute_number_epochs, _mpc_table_to_df, _parse_start_dt, _standardize_columns
 
 ProgressCB = Optional[Callable[[int, int, str, str], None]]
 
-_PROV_RE = re.compile(r"\b((?:19|20)\d{2}\s+[A-Z]{1,3}\d{0,3}[A-Z]?)\b")
-_PACKED_RE = re.compile(r"\b([A-Z]\d{3}\s+[A-Z]{1,3})\b")
-
 
 def mpc_query_variants(object_name: str) -> List[str]:
-    """Gera identificadores alternativos para o MPC.
+    """Identificadores para consulta MPC, em ordem de preferência.
 
-    Muitos CSVs trazem nomes como '1036 Ganymed A924 UB' ou
-    '398188 Agni 2010 LE15'. O MPC geralmente aceita melhor o numero
-    ('1036') ou a designacao ('2010 LE15') do que a string completa.
+    Regra:
+    1. número oficial MPC, se existir;
+    2. designação provisória, se existir;
+    3. designação packed, se existir;
+    4. nome próprio/original como última alternativa.
     """
-    raw = str(object_name).replace("(", "").replace(")", "").replace("*", "").strip()
-    raw = " ".join(raw.split())
-    if not raw:
-        return []
-
-    out: List[str] = []
-    tokens = raw.split()
-
-    # Numero MPC no inicio. Evita interpretar designacoes como '2021 VR3' como numero.
-    if tokens and tokens[0].isdigit():
-        n = int(tokens[0])
-        if not (1900 <= n <= 2099 and len(tokens) == 2):
-            out.append(tokens[0])
-
-    # Designacao provisoria classica, ex.: 2010 LE15, 2004 FE31, 2021 VR3.
-    for match in _PROV_RE.findall(raw):
-        out.append(match.strip())
-
-    # Designacao packed/cometa antiga que aparece em alguns exportes, ex.: A924 UB.
-    for match in _PACKED_RE.findall(raw):
-        out.append(match.strip())
-
-    out.append(raw)
-
-    clean: List[str] = []
-    seen = set()
-    for item in out:
-        item = " ".join(str(item).split())
-        key = item.lower()
-        if item and key not in seen:
-            clean.append(item)
-            seen.add(key)
-    return clean
+    return identifier_variants(object_name, include_name=True)
 
 
 def _cache_key(cfg: ConfigMissao, obj: str) -> str:
+    preferred = parse_object_identifier(obj).get("identificador_preferido") or str(obj)
     base = json.dumps(
         {
-            "obj": obj,
+            "obj": preferred,
+            "obj_original": str(obj),
             "obs": cfg.observatorio,
             "ini": cfg.data_inicio,
             "fim": cfg.data_fim,
             "hora": cfg.hora_inicio_utc,
             "step_min": cfg.step_min,
-            "resolver": "variants_v1",
+            "resolver": "preferred_official_v2",
         },
         sort_keys=True,
     )
@@ -87,7 +57,7 @@ def obter_mpc_astroquery_resiliente(
         "baixados": 0,
         "falhas": [],
         "identificadores_usados": [],
-        "mpc_mode": "start_step_number_variants",
+        "mpc_mode": "start_step_number_preferred_official",
         "proper_motion_unit": None,
         "step_quantity": None,
     }
@@ -114,13 +84,14 @@ def obter_mpc_astroquery_resiliente(
     all_rows: List[pd.DataFrame] = []
 
     for i, obj in enumerate(lista_obj, start=1):
+        id_info = parse_object_identifier(obj)
         variants = mpc_query_variants(obj)
         if progress_cb:
             progress_cb(i, total, obj, "cache/check")
 
         key = _cache_key(cfg, obj)
-        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(obj)).strip("_")[:80]
-        p_cache = cache_dir / f"mpc_{safe_name}_{key}.parquet"
+        safe_preferred = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(id_info.get("identificador_preferido") or obj)).strip("_")[:80]
+        p_cache = cache_dir / f"mpc_{safe_preferred}_{key}.parquet"
 
         if p_cache.exists():
             try:
@@ -165,13 +136,21 @@ def obter_mpc_astroquery_resiliente(
             aud["falhas"].append(
                 {
                     "object": obj,
+                    "identificador_preferido": id_info.get("identificador_preferido"),
+                    "numero_oficial": id_info.get("numero_oficial"),
+                    "designacao_provisoria": id_info.get("designacao_provisoria"),
                     "tentativas": variants,
                     "erro": str(last_err) if last_err else "Falha desconhecida",
                 }
             )
             continue
 
+        # Mantém o nome original para rastreabilidade, mas adiciona o identificador limpo para MPC/ROCKS.
         df_obj["Nome_limpo"] = obj
+        df_obj["Objeto_original"] = id_info.get("nome_original") or obj
+        df_obj["Identificador_preferido"] = id_info.get("identificador_preferido") or used_target
+        df_obj["Numero_oficial"] = id_info.get("numero_oficial")
+        df_obj["Designacao_provisoria"] = id_info.get("designacao_provisoria")
         df_obj["MPC_target_usado"] = used_target
 
         if "mu" in df_obj.columns and used_unit == "arcsec/h":
@@ -179,7 +158,14 @@ def obter_mpc_astroquery_resiliente(
 
         aud["proper_motion_unit"] = used_unit
         aud["baixados"] += 1
-        aud["identificadores_usados"].append({"object": obj, "target_usado": used_target, "tentativas": variants})
+        aud["identificadores_usados"].append(
+            {
+                "object": obj,
+                "identificador_preferido": id_info.get("identificador_preferido"),
+                "target_usado": used_target,
+                "tentativas": variants,
+            }
+        )
 
         try:
             df_obj.to_parquet(p_cache, index=False)
