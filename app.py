@@ -10,9 +10,9 @@ from pipeline import (
     criar_run_dir,
     salvar_manifest,
     ler_jpl_csvs,
-    enriquecer_taxonomia_rocks,
 )
 from mpc_fix import obter_mpc_astroquery_resiliente
+from rocks_fix import enriquecer_taxonomia_rocks_resiliente
 from campaign import (
     validate_night_params,
     mpc_query_dates_for_nights,
@@ -147,7 +147,7 @@ if st.session_state.lista_obj is None:
 
 st.header("Etapa 2 - Buscar efemerides MPC")
 st.caption(f"Consulta cobrindo noites {hora_noite_inicio}-{hora_noite_fim} UTC. Intervalo MPC usado: {cfg_mpc.data_inicio} {cfg_mpc.hora_inicio_utc} ate {cfg_mpc.data_fim} {cfg_mpc.hora_inicio_utc}.")
-st.caption("O app agora tenta automaticamente identificadores alternativos: numero MPC, designacao provisoria e nome completo.")
+st.caption("O app tenta automaticamente identificadores em ordem: numero oficial, designacao provisoria e nome original.")
 
 if st.button("Buscar efemerides"):
     if errors:
@@ -204,7 +204,7 @@ if st.session_state.ranked is None:
     st.stop()
 
 st.header("Etapa 4 - Verificar taxonomia publicada via ROCKS")
-st.caption("Para reduzir trabalho, o ROCKS e consultado apenas nos melhores candidatos observacionais.")
+st.caption("Para reduzir trabalho, o ROCKS e consultado apenas nos melhores candidatos observacionais, usando o identificador preferido.")
 
 if st.button("Consultar ROCKS nos melhores candidatos"):
     base = st.session_state.ranked.head(int(max_rocks)).copy()
@@ -213,7 +213,7 @@ if st.button("Consultar ROCKS nos melhores candidatos"):
     def tax_progress_cb(i_atual: int, total: int, obj: str, fase: str):
         tax_status.info(f"ROCKS {i_atual}/{total}: {obj}")
 
-    ranked_tax, aud_tax = enriquecer_taxonomia_rocks(base, progress_cb=tax_progress_cb)
+    ranked_tax, aud_tax = enriquecer_taxonomia_rocks_resiliente(base, progress_cb=tax_progress_cb)
     if "Taxonomia disponível" in ranked_tax.columns:
         ranked_tax["Taxonomia_encontrada"] = ranked_tax["Taxonomia disponível"]
     if "Classe taxonômica" in ranked_tax.columns:
