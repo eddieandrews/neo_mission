@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import socket
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -8,6 +9,31 @@ import pandas as pd
 from object_ids import identifier_variants, parse_object_identifier
 
 ProgressCB = Optional[Callable[[int, int, str, str], None]]
+
+
+def _force_threaded_resolver() -> str:
+    """Evita falhas do aiohttp/aiodns no Windows quando o DNS do sistema funciona.
+
+    O space-rocks usa chamadas HTTP assíncronas. Em alguns ambientes Windows,
+    o resolver async baseado em aiodns/pycares falha com 'Could not contact DNS servers',
+    mesmo quando nslookup e Test-NetConnection funcionam. Forçamos o aiohttp a usar
+    o resolver em thread, baseado no socket/getaddrinfo do sistema operacional.
+    """
+    try:
+        import aiohttp.resolver as aio_resolver  # type: ignore
+        if hasattr(aio_resolver, "ThreadedResolver"):
+            aio_resolver.DefaultResolver = aio_resolver.ThreadedResolver
+            return "aiohttp.ThreadedResolver"
+        return "aiohttp.resolver_sem_ThreadedResolver"
+    except Exception as exc:
+        return f"resolver_patch_failed: {exc}"
+
+
+def _system_dns_test(host: str = "ssp.imcce.fr") -> str:
+    try:
+        return str(socket.getaddrinfo(host, 443)[0][4][0])
+    except Exception as exc:
+        return f"socket_dns_failed: {exc}"
 
 
 def _val(x: Any) -> Any:
@@ -62,14 +88,16 @@ def _table(table: Any, cols: List[str]) -> Any:
     return None
 
 
-def _import_rocks() -> Tuple[Any, Optional[str]]:
+def _import_rocks() -> Tuple[Any, Optional[str], str, str]:
+    resolver_patch = _force_threaded_resolver()
+    dns_ip = _system_dns_test()
     try:
         rocks_mod = importlib.import_module("rocks")
     except Exception as exc:
-        return None, f"Nao importou rocks/space-rocks: {exc}"
+        return None, f"Nao importou rocks/space-rocks: {exc}", resolver_patch, dns_ip
     if not hasattr(rocks_mod, "Rock") or not hasattr(rocks_mod, "id"):
-        return None, "O modulo rocks importado nao possui Rock/id; instale space-rocks."
-    return rocks_mod, None
+        return None, "O modulo rocks importado nao possui Rock/id; instale space-rocks.", resolver_patch, dns_ip
+    return rocks_mod, None, resolver_patch, dns_ip
 
 
 def _resolve(rocks_mod: Any, variants: List[str]) -> Tuple[Any, Optional[str], Optional[str]]:
@@ -95,7 +123,8 @@ def query_rocks_resilient(object_name: str) -> Dict[str, Any]:
         "designacao_provisoria": info.get("designacao_provisoria"),
         "tentativas": variants,
     }
-    rocks_mod, err = _import_rocks()
+    rocks_mod, err, resolver_patch, dns_ip = _import_rocks()
+    base.update({"dns_resolver_usado": resolver_patch, "python_dns_ssp": dns_ip})
     if err:
         return {**base, "status": "space_rocks_unavailable", "has_taxonomy": False, "error": err}
 
@@ -133,7 +162,7 @@ def query_rocks_resilient(object_name: str) -> Dict[str, Any]:
 
 
 def enriquecer_taxonomia_rocks_resiliente(ranked: pd.DataFrame, progress_cb: ProgressCB = None) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    aud: Dict[str, Any] = {"objetos_entrada": 0, "objetos_consultados": 0, "objetos_com_taxonomia": 0, "objetos_sem_taxonomia": 0, "falhas": [], "rocks_disponivel": None, "metodo": "space-rocks Rock(datacloud=taxonomies)"}
+    aud: Dict[str, Any] = {"objetos_entrada": 0, "objetos_consultados": 0, "objetos_com_taxonomia": 0, "objetos_sem_taxonomia": 0, "falhas": [], "rocks_disponivel": None, "metodo": "space-rocks Rock(datacloud=taxonomies) + aiohttp ThreadedResolver"}
     if ranked is None or ranked.empty:
         return pd.DataFrame(), aud
     if "Nome_limpo" not in ranked.columns:
@@ -149,10 +178,10 @@ def enriquecer_taxonomia_rocks_resiliente(ranked: pd.DataFrame, progress_cb: Pro
         cache[obj] = res
         aud["objetos_consultados"] += 1
         if res.get("status") != "ok":
-            aud["falhas"].append({"object": obj, "status": res.get("status"), "erro": res.get("error"), "tentativas": res.get("tentativas")})
+            aud["falhas"].append({"object": obj, "status": res.get("status"), "erro": res.get("error"), "tentativas": res.get("tentativas"), "dns_resolver_usado": res.get("dns_resolver_usado"), "python_dns_ssp": res.get("python_dns_ssp")})
     mapping = {
         "Identificador_preferido": "identificador_preferido", "Tipo_identificador_preferido": "tipo_identificador_preferido", "Numero_oficial": "numero_oficial", "Designacao_provisoria": "designacao_provisoria",
-        "ROCKS_target_usado": "rocks_target_usado", "ROCKS_resolved_name": "rocks_resolved_name", "ROCKS_resolved_number": "rocks_resolved_number", "ROCKS_resolved_from": "rocks_resolved_from",
+        "ROCKS_target_usado": "rocks_target_usado", "ROCKS_resolved_name": "rocks_resolved_name", "ROCKS_resolved_number": "rocks_resolved_number", "ROCKS_resolved_from": "rocks_resolved_from", "DNS_resolver_usado": "dns_resolver_usado", "Python_DNS_ssp": "python_dns_ssp",
         "Taxonomia disponível": "has_taxonomy", "Classe taxonômica": "taxonomy_class", "Complexo taxonômico": "taxonomy_complex", "Esquema taxonômico": "taxonomy_scheme", "Metodo taxonomia": "taxonomy_method", "Faixa taxonomia": "taxonomy_waverange", "Fonte taxonomia": "taxonomy_source", "Taxonomia_datacloud_rows": "taxonomy_datacloud_rows", "Taxonomia_status_consulta": "status", "Taxonomia_erro": "error",
         "D_km": "D_km", "Albedo": "Albedo", "H": "H", "Prot_h": "Prot_h", "Porb_yr": "Porb_yr",
     }
