@@ -102,11 +102,11 @@ def filter_observable_nights(df_mpc: pd.DataFrame, cfg: Any, start_utc: str, end
     colmap = {
         "V": ["V", "mag", "Mag", "Vmag", "Magnitude"],
         "Alt": ["Alt", "alt", "Altitude", "EL", "El", "elev", "Elevation"],
-        "SunAlt": ["SunAlt", "sunAlt", "SolAlt", "SunEl", "Sun_EL", "Sun_elev", "SunElevation"],
+        "SunAlt": ["SunAlt", "sunAlt", "SolAlt", "SunEl", "Sun_EL", "Sun_elev", "SunElevation", "Sun altitude"],
         "alpha": ["alpha", "Alpha", "phase", "Phase", "Phase_angle", "PhaseAngle", "Phase angle"],
         "dRA": ["dRA", "RA_rate", "ra_rate", "RA motion", "RA_motion", "dRA/dt"],
         "dDec": ["dDec", "Dec_rate", "dec_rate", "Dec motion", "Dec_motion", "dDec/dt"],
-        "mu_total": ["mu_total", "mu", "pm", "ProperMotion", "proper_motion", "Sky motion", "sky_motion"],
+        "mu_total": ["mu_total", "mu", "pm", "ProperMotion", "Proper motion", "proper_motion", "Sky motion", "sky_motion"],
     }
     for target, names in colmap.items():
         col = _find_col(df, names)
