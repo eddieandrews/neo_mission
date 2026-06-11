@@ -22,7 +22,7 @@ from campaign import (
     make_color_candidates,
     make_coordinator_support,
 )
-from diagnostics import cache_stats, clear_cache, rocks_diagnostic, identifiers_audit_df
+from diagnostics import cache_stats, clear_cache, rocks_diagnostic, identifiers_audit_df, environment_diagnostic
 
 st.set_page_config(page_title="Y28 NEO Mission Pipeline", layout="wide")
 st.title("Y28 - candidatos de NEOs para estudo de cores")
@@ -120,7 +120,16 @@ with ctrl3:
         st.warning("Cache apagado. A proxima consulta MPC sera refeita do zero.")
         st.json(res)
 
+env_diag = environment_diagnostic()
+if env_diag.get("aiodns_instalado") or env_diag.get("pycares_instalado"):
+    st.error("Ambiente com aiodns/pycares instalado. Isso pode quebrar o DNS do space-rocks no Windows.")
+    st.code("pip uninstall aiodns pycares -y", language="powershell")
+else:
+    st.success("Ambiente ROCKS/DNS OK: aiodns e pycares não estão instalados.")
+
 with st.expander("Diagnostico do reconhecimento de objetos e ROCKS", expanded=False):
+    st.write("Diagnóstico do ambiente Python usado pelo app:")
+    st.json(env_diag)
     exemplos_default = "1566 Icarus 1949 MA\n1036 Ganymed A924 UB\n398188 Agni 2010 LE15\n2021 VR3\n(23714) 1998 EC3"
     diag_text = st.text_area("Objetos para testar", value=exemplos_default, height=120)
     diag_objs = [x.strip() for x in diag_text.splitlines() if x.strip()]
@@ -129,10 +138,12 @@ with st.expander("Diagnostico do reconhecimento de objetos e ROCKS", expanded=Fa
         st.dataframe(identifiers_audit_df(diag_objs), use_container_width=True)
     if st.button("Testar se ROCKS esta funcionando"):
         diag = rocks_diagnostic(diag_objs)
-        if not diag.get("installed"):
-            st.error("ROCKS nao foi importado no ambiente atual.")
+        if not diag.get("rocks_importado"):
+            st.error("ROCKS/space-rocks nao foi importado no ambiente atual.")
+        elif diag.get("aiodns_instalado") or diag.get("pycares_instalado"):
+            st.error("ROCKS importado, mas aiodns/pycares ainda estão instalados. Remova antes de confiar no resultado.")
         else:
-            st.success(f"ROCKS importado. Versao: {diag.get('version')}")
+            st.success(f"ROCKS importado. Versao: {diag.get('rocks_version')}")
         st.json(diag)
 
 # =========================
